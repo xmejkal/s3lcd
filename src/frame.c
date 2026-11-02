@@ -8,6 +8,10 @@
 //
 // With partial on, show() sends only the tiles drawn in this frame or the one
 // before, as rectangles. Draws mark their tiles through frame_dirty().
+//
+// With framebuffer="double", the frame is in PSRAM and show() copies the
+// windows into `outgoing`, an internal buffer, queues them and returns. The
+// next frame is drawn while they go out; the next show() waits for them first.
 
 #include <string.h>
 
@@ -20,6 +24,7 @@
 #define FRAME_TIMEOUT_MS 100            // default: a full frame takes 31 ms at the real 40 MHz
 #define FRAME_TIMEOUT_MAX_MS 60000      // a longer wait would only hide a dead bus
 #define FRAME_DMA_CAPS (MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define FRAME_PSRAM_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)     // outside MicroPython's heap: gc never scans it
 #define FRAME_STRIP_COUNT 2
 #define FRAME_ALL_SENT 0                // windows in flight when the panel has the whole frame
 #define FRAME_OTHER_STRIP 1             // windows in flight when a strip may be filled again
@@ -80,9 +85,10 @@ static void frame_alloc_marks(frame_t *frame, uint16_t longest_axis) {
     frame_dirty_all(frame);
 }
 
-// At init(), before the bus: the framebuffer first, so that it gets the
-// largest internal block, then the strips. "dma" falls back to "strips" with a
-// notice when the swap needs a copy or no block is large enough.
+// At init(), before the bus: the framebuffer (or "double"'s outgoing buffer)
+// first, so that it gets the largest internal block, then the strips. "dma"
+// falls back to "strips" with a notice when the swap needs a copy or no block
+// is large enough, and so does "double" when no block is large enough.
 void frame_alloc(frame_t *frame, uint16_t width, uint16_t height) {
     if (frame->pixels != NULL) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("init() again: call deinit() first"));
@@ -101,6 +107,21 @@ void frame_alloc(frame_t *frame, uint16_t width, uint16_t height) {
             frame->memory = FRAME_IN_STRIPS;
         }
     }
+    if (frame->memory == FRAME_DOUBLE) {
+        frame->outgoing = heap_caps_malloc(frame->size, FRAME_DMA_CAPS);
+        if (frame->outgoing == NULL) {
+            mp_printf(&mp_plat_print, "frame: no free internal block of %u bytes, so framebuffer=\"strips\"\n",
+                (unsigned)frame->size);
+            frame->memory = FRAME_IN_STRIPS;
+        } else {
+            frame->pixels = heap_caps_malloc(frame->size, FRAME_PSRAM_CAPS);
+        }
+        if (frame->outgoing != NULL && frame->pixels == NULL) {
+            heap_caps_free(frame->outgoing);
+            frame->outgoing = NULL;     // or the next frame_free() frees it again
+            mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("frame: no PSRAM for the frame"));
+        }
+    }
     if (frame->memory == FRAME_IN_STRIPS) {
         frame->pixels = m_malloc(frame->size);      // MicroPython's heap: PSRAM on this board
     }
@@ -116,9 +137,10 @@ void frame_alloc(frame_t *frame, uint16_t width, uint16_t height) {
 }
 
 // The largest single send the bus must take: the whole frame from internal
-// RAM, or else one strip.
+// RAM or from `outgoing`, or else one strip. The i80 bus reads it too, untested
+// with "double" (P556 #760 tested SPI only).
 size_t frame_max_transfer(const frame_t *frame) {
-    return frame->memory == FRAME_IN_DMA ? frame->size : frame->strip_size;
+    return frame->memory == FRAME_IN_STRIPS ? frame->strip_size : frame->size;
 }
 
 void frame_attach(frame_t *frame, esp_lcd_panel_handle_t panel) {
@@ -186,12 +208,14 @@ typedef struct {
 } frame_window_t;
 
 // One show(): the frame's width in this rotation, the start of its one
-// deadline, and how many strips it filled so far, across windows.
+// deadline, how many strips it filled so far, across windows, and with
+// "double" how many pixels it packed into `outgoing` so far.
 typedef struct {
     frame_t *frame;
     uint16_t width;
     TickType_t start;
     unsigned turn;
+    size_t packed_pixels;
 } frame_send_t;
 
 // Queue one window. The count goes up first, because the interrupt can end
@@ -216,6 +240,23 @@ static void frame_copy(const frame_t *frame, uint16_t *dst, const uint16_t *src,
     }
 }
 
+// A copy of the rectangle's rows, packed into dst, queued from there. Whole rows
+// are one block in the frame, so they are one copy.
+static void frame_queue_copy(frame_send_t *send, frame_rect_t rect, uint16_t *dst) {
+    frame_t *frame = send->frame;
+    uint16_t w = rect.x1 - rect.x0;
+    uint16_t rows = rect.y1 - rect.y0;
+    const uint16_t *src = frame->pixels + (size_t)rect.y0 * send->width + rect.x0;
+    if (w == send->width) {
+        frame_copy(frame, dst, src, (size_t)w * rows);
+    } else {
+        for (uint16_t r = 0; r < rows; r++) {
+            frame_copy(frame, dst + (size_t)r * w, src + (size_t)r * send->width, w);
+        }
+    }
+    frame_queue(frame, rect, dst);
+}
+
 // The rectangle through the strips, as many rows at a time as a strip holds:
 // the copy of one strip overlaps the send of the other. Windows end in order,
 // so when at most one is in flight, the window that used this strip two
@@ -223,26 +264,32 @@ static void frame_copy(const frame_t *frame, uint16_t *dst, const uint16_t *src,
 // it starts the next, so this wait is the guard, not the pace.
 static void frame_send_strips(frame_send_t *send, frame_rect_t rect) {
     frame_t *frame = send->frame;
-    uint16_t w = rect.x1 - rect.x0;
-    uint16_t step = frame->strip_size / sizeof(uint16_t) / w;     // rows per strip
+    uint16_t step = frame->strip_size / sizeof(uint16_t) / (rect.x1 - rect.x0);     // rows per strip
     for (uint16_t y = rect.y0; y < rect.y1; y += step) {
         uint16_t rows = rect.y1 - y < step ? rect.y1 - y : step;
         uint16_t *strip = frame->strips[send->turn++ % FRAME_STRIP_COUNT];
         frame_wait_or_raise(frame, FRAME_OTHER_STRIP, send->start);
-        const uint16_t *src = frame->pixels + (size_t)y * send->width + rect.x0;
-        for (uint16_t r = 0; r < rows; r++) {
-            frame_copy(frame, strip + (size_t)r * w, src + (size_t)r * send->width, w);
-        }
-        frame_queue(frame, (frame_rect_t){rect.x0, y, rect.x1, y + rows}, strip);
+        frame_queue_copy(send, (frame_rect_t){rect.x0, y, rect.x1, y + rows}, strip);
     }
 }
 
+// "double": the rectangle into `outgoing`, after the windows this show()
+// packed before it, so the copy of one window runs while the one before is
+// sent. Windows never share a tile, so they fit in one frame's size. Nothing
+// waits here: the first wait of show() made sure the last frame was out.
+static void frame_send_packed(frame_send_t *send, frame_rect_t rect) {
+    frame_queue_copy(send, rect, send->frame->outgoing + send->packed_pixels);
+    send->packed_pixels += (size_t)(rect.x1 - rect.x0) * (rect.y1 - rect.y0);
+}
+
 // Whole rows of an internal framebuffer are one block of memory, so DMA reads
-// them where they are. Anything else goes through the strips.
+// them where they are. "double" packs into `outgoing`. Anything else goes
+// through the strips.
 static void frame_send_rect(frame_send_t *send, frame_rect_t rect) {
     frame_t *frame = send->frame;
-    bool whole_rows = rect.x0 == 0 && rect.x1 == send->width;
-    if (frame->memory == FRAME_IN_DMA && whole_rows) {
+    if (frame->memory == FRAME_DOUBLE) {
+        frame_send_packed(send, rect);
+    } else if (frame->memory == FRAME_IN_DMA && rect.x0 == 0 && rect.x1 == send->width) {
         frame_queue(frame, rect, frame->pixels + (size_t)rect.y0 * send->width);
     } else {
         frame_send_strips(send, rect);
@@ -327,12 +374,16 @@ void frame_dirty_all(frame_t *frame) {
 }
 
 // Send what changed, or the whole frame, and return when the panel has all of
-// it. Returns the count of windows queued: each costs bus setup.
+// it. With "double", return once it is queued: the next show() waits for it.
+// Returns the count of windows queued: each costs bus setup.
 uint16_t frame_show(frame_t *frame, uint16_t width, uint16_t height) {
-    frame_send_t send = {frame, width, xTaskGetTickCount(), 0};
+    frame_send_t send = {frame, width, xTaskGetTickCount(), 0, 0};
     frame->queued = 0;
-    // A window of a frame that timed out can still end now. Wait for it first,
-    // so that it cannot count as a window of this frame.
+    // A window of a frame that timed out can still end now, and with "double"
+    // the last frame is usually still going out. Wait for it first, so that it
+    // cannot count as a window of this frame and `outgoing` is free to fill.
+    // So with "double" the timeout covers the last send and this show(), and a
+    // dead bus raises one show() late.
     frame_wait_or_raise(frame, FRAME_ALL_SENT, send.start);
     int shift = frame->config.tile_shift;
     int cols = (width + (1 << shift) - 1) >> shift;
@@ -345,7 +396,9 @@ uint16_t frame_show(frame_t *frame, uint16_t width, uint16_t height) {
     for (int i = 0; i < count; i++) {
         frame_send_rect(&send, frame_window_rect(frame, windows[i], width, height));
     }
-    frame_wait_or_raise(frame, FRAME_ALL_SENT, send.start);
+    if (frame->memory != FRAME_DOUBLE) {
+        frame_wait_or_raise(frame, FRAME_ALL_SENT, send.start);
+    }
     frame_age_marks(frame);
     return frame->queued;
 }
@@ -363,13 +416,15 @@ void frame_free(frame_t *frame) {
         vSemaphoreDelete(done);
     }
     if (frame->pixels != NULL) {
-        if (frame->memory == FRAME_IN_DMA) {
-            heap_caps_free(frame->pixels);
-        } else {
+        if (frame->memory == FRAME_IN_STRIPS) {
             m_free(frame->pixels);
+        } else {
+            heap_caps_free(frame->pixels);
         }
         frame->pixels = NULL;
     }
+    heap_caps_free(frame->outgoing);
+    frame->outgoing = NULL;
     for (int i = 0; i < FRAME_STRIP_COUNT; i++) {
         heap_caps_free(frame->strips[i]);
         frame->strips[i] = NULL;
@@ -430,8 +485,10 @@ static frame_memory_t frame_parse_memory(const frame_t *frame, mp_obj_t value) {
         memory = FRAME_IN_DMA;
     } else if (name == MP_QSTR_strips) {
         memory = FRAME_IN_STRIPS;
+    } else if (name == MP_QSTR_double) {
+        memory = FRAME_DOUBLE;
     } else {
-        mp_raise_ValueError(MP_ERROR_TEXT("framebuffer must be \"dma\" or \"strips\""));
+        mp_raise_ValueError(MP_ERROR_TEXT("framebuffer must be \"dma\", \"strips\" or \"double\""));
     }
     bool fixed = frame->pixels != NULL && memory != frame->memory && memory != frame->config.memory;
     if (fixed) {
@@ -456,7 +513,7 @@ static uint8_t frame_parse_tile(mp_obj_t value) {
 // Checked on the result, so that defaults=True cannot bring a swap back.
 static void frame_check_swap(const frame_t *frame, const frame_config_t *next) {
     if (next->swap && frame->pixels != NULL && frame->memory == FRAME_IN_DMA) {
-        mp_raise_ValueError(MP_ERROR_TEXT("swap needs framebuffer=\"strips\"; set both before init()"));
+        mp_raise_ValueError(MP_ERROR_TEXT("swap needs framebuffer=\"strips\" or \"double\"; set both before init()"));
     }
 }
 
@@ -488,13 +545,20 @@ static frame_config_t frame_parse(const frame_t *frame, const mp_arg_val_t *args
     return next;
 }
 
+// The config() name of each frame_memory_t.
+static const qstr frame_memory_names[] = {
+    [FRAME_IN_DMA] = MP_QSTR_dma,
+    [FRAME_IN_STRIPS] = MP_QSTR_strips,
+    [FRAME_DOUBLE] = MP_QSTR_double,
+};
+
 // After init() it reports the memory in use, which differs after a fallback.
 static mp_obj_t frame_config_dict(const frame_t *frame) {
     frame_memory_t memory = frame->pixels != NULL ? frame->memory : frame->config.memory;
     mp_obj_t dict = mp_obj_new_dict(0);
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_timeout), mp_obj_new_int(frame->config.timeout_ms));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_framebuffer),
-        MP_OBJ_NEW_QSTR(memory == FRAME_IN_DMA ? MP_QSTR_dma : MP_QSTR_strips));
+        MP_OBJ_NEW_QSTR(frame_memory_names[memory]));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_partial), mp_obj_new_bool(frame->config.partial));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_tile), mp_obj_new_int(1 << frame->config.tile_shift));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_windows), mp_obj_new_int(frame->config.windows));

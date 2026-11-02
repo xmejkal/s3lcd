@@ -20,6 +20,7 @@
 typedef enum {
     FRAME_IN_DMA,       // "dma": internal DMA RAM, sent as it is, with no copy
     FRAME_IN_STRIPS,    // "strips": PSRAM, copied through two internal strips
+    FRAME_DOUBLE,       // "double": PSRAM, copied into `outgoing`, which is sent while the next frame is drawn
 } frame_memory_t;
 
 // The settings Python sets through config().
@@ -29,7 +30,7 @@ typedef struct {
     bool partial;               // send only the tiles that changed, not the whole frame
     uint8_t tile_shift;         // a tile is 1 << tile_shift pixels square
     uint8_t windows;            // past this many windows, show() sends the whole frame instead
-    bool swap;                  // swap the two bytes of each pixel on send; needs "strips"
+    bool swap;                  // swap the two bytes of each pixel on send; needs "strips" or "double"
 } frame_config_t;
 
 // The marks of one tile: drawn in this frame, drawn in the frame before.
@@ -42,6 +43,7 @@ typedef struct {
     frame_memory_t memory;          // in use since init(); differs from config.memory after a fallback
     esp_lcd_panel_handle_t panel;
     uint16_t *pixels;               // the framebuffer
+    uint16_t *outgoing;             // "double": internal DMA RAM, the last show()'s windows, packed, on their way out
     size_t size;                    // its size in bytes
     uint16_t *strips[2];            // internal DMA buffers: the copy of one overlaps the send of the other
     uint16_t strip_rows;            // rows per strip
