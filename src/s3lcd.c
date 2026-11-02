@@ -2689,21 +2689,25 @@ static mp_obj_t s3lcd_deinit(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_deinit_obj, 1, 1, s3lcd_deinit);
 
 ///
-/// .config({timeout=ms, framebuffer="dma"|"strips", partial=bool, tile=px, windows=n, swap=bool, defaults=bool})
+/// .config({timeout=ms, framebuffer="dma"|"strips"|"double", partial=bool, tile=px, windows=n, swap=bool, defaults=bool})
 /// Set the settings given, all or none, and return every setting as a dict. config() only reads.
 /// An unknown key raises TypeError naming it. A bad value raises ValueError naming the key and what it allows,
 /// and a setting that needs init() again, given after init(), raises ValueError saying so.
 /// -- timeout: 1 to 60000 ms, default 100. show() raises OSError(ETIMEDOUT) when its windows have not all ended
 ///    by then, checked at each wait, to within one 10 ms tick. esp_lcd's own waits inside a send have no limit,
-///    so a dead bus still hangs.
+///    so a dead bus still hangs. With "double", show() returns before the send ends, so the next show() waits
+///    for it: its timeout covers the last send and itself, and a dead bus raises one show() late.
 /// -- framebuffer: "dma" keeps the frame in internal DMA RAM and sends it with no copy; "strips" keeps it
-///    in PSRAM and copies it through two internal strips. Set it before init(). Default "dma"; when no
-///    internal block is large enough, or the bus swaps bytes, init() prints a notice and uses "strips".
+///    in PSRAM and copies it through two internal strips; "double" keeps it in PSRAM, outside MicroPython's
+///    heap, and show() copies the changed windows into an internal buffer, queues them and returns, so the next
+///    frame is drawn during the send. Set it before init(). Default "dma"; when no internal block is large
+///    enough, or "dma" with the bus swapping bytes, init() prints a notice and uses "strips". "double" with no
+///    PSRAM block raises OSError.
 ///    After init(), the value in use and the value asked for are both accepted, so config(**config()) works.
 /// -- partial: show() sends only the tiles drawn in this frame or the one before. Default False.
 /// -- tile: the tile's side, 8, 16 or 32 px. Default 16.
 /// -- windows: past this many rectangles of changed tiles, show() sends the whole frame. 1 to 64, default 40.
-/// -- swap: swap the two bytes of each pixel on send. Needs "strips". Default: the bus's swap_color_bytes.
+/// -- swap: swap the two bytes of each pixel on send. Needs "strips" or "double". Default: the bus's swap_color_bytes.
 /// -- defaults: True restores every setting first, then applies the others given.
 ///
 

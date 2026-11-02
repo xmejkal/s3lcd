@@ -20,6 +20,7 @@
 typedef enum {
     FRAME_IN_DMA,       // "dma": internal DMA RAM, sent as it is, with no copy
     FRAME_IN_STRIPS,    // "strips": PSRAM, copied through two internal strips
+    FRAME_DOUBLE,       // "double": PSRAM, copied into `outgoing`, which is sent while the next frame is drawn
 } frame_memory_t;
 
 // The settings Python sets through config().
@@ -42,6 +43,7 @@ typedef struct {
     frame_memory_t memory;          // in use since init(); differs from config.memory after a fallback
     esp_lcd_panel_handle_t panel;
     uint16_t *pixels;               // the framebuffer
+    uint16_t *outgoing;             // "double": internal DMA RAM, the last show()'s windows, packed, on their way out
     size_t size;                    // its size in bytes
     uint16_t *strips[2];            // internal DMA buffers: the copy of one overlaps the send of the other
     uint16_t strip_rows;            // rows per strip
