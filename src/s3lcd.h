@@ -4,6 +4,7 @@
 
 #include "esp_lcd_panel_io.h"
 #include "mpfile.h"
+#include "frame.h"
 
 //
 // Default Values for T-Display-S3 170x320 ST7796
@@ -92,11 +93,12 @@ typedef struct _s3lcd_obj_t {
     uint8_t color_space;
     bool inversion_mode;
     mp_file_t *fp;                          // file object
+    frame_t frame;                          // the framebuffer memory and its send to the panel
     size_t frame_buffer_size;               // frame buffer size in bytes
-    uint16_t *frame_buffer;                 // frame buffer
-    uint16_t dma_rows;                      // dma transfer buffer height in rows
-    uint16_t *dma_buffer;                   // dma transfer buffer
-    size_t dma_buffer_size;                 // dma transfer buffer size in bytes
+    uint16_t *frame_buffer;                 // frame.pixels, for the drawing code
+    uint16_t dma_rows;                      // rows per strip
+    uint16_t *dma_buffer;                   // frame.strips[0], scratch for jpg and png
+    size_t dma_buffer_size;                 // frame.strip_size
     uint16_t *work_buffer;                  // work frame buffer
     void *work;                             // work buffer for jpg & png decoding
     uint8_t *scanline_ringbuf;              // png scanline_ringbuf

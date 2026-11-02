@@ -165,12 +165,6 @@ s3lcd_rotation_t *ROTATIONS[] = {
     NULL
 };
 
-//
-// flag to indicate an esp_lcd_panel_draw_bitmap operation is in progress
-//
-
-static volatile bool lcd_panel_active = false;
-
 static void s3lcd_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     (void)kind;
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(self_in);
@@ -1286,11 +1280,6 @@ static mp_obj_t s3lcd_vscsad(mp_obj_t self_in, mp_obj_t vssa_in) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_2(s3lcd_vscsad_obj, s3lcd_vscsad);
 
-static bool lcd_panel_done(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx) {
-    lcd_panel_active = false;
-    return false;
-}
-
 ///
 /// .scroll(xstep, ystep{, fill=0})
 /// Scroll the framebuffer in the given direction.
@@ -1399,6 +1388,14 @@ static void custom_init(s3lcd_obj_t *self) {
 static mp_obj_t s3lcd_init(mp_obj_t self_in) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
+    // The frame comes before the bus: its memory sets the bus's largest transfer.
+    bool swap = mp_obj_is_type(self->bus, &s3lcd_spi_bus_type)
+        && ((s3lcd_spi_bus_obj_t *)MP_OBJ_TO_PTR(self->bus))->flags.swap_color_bytes;
+    frame_alloc(&self->frame, self->width, self->height, swap);
+    self->frame_buffer = self->frame.pixels;
+    self->dma_buffer = self->frame.strips[0];
+    self->dma_buffer_size = self->frame.strip_size;
+
     if (mp_obj_is_type(self->bus, &s3lcd_i80_bus_type)) {
         ESP_LOGI(TAG, "Initialize Intel 8080 bus");
         s3lcd_i80_bus_obj_t *config = MP_OBJ_TO_PTR(self->bus);
@@ -1419,7 +1416,7 @@ static mp_obj_t s3lcd_init(mp_obj_t self_in) {
                 config->data_gpio_nums[7],
             },
             .bus_width = config->bus_width,
-            .max_transfer_bytes = self->dma_buffer_size,
+            .max_transfer_bytes = frame_max_transfer(&self->frame),
         };
 
         ESP_ERROR_CHECK(esp_lcd_new_i80_bus(&bus_config, &self->bus_handle.i80));
@@ -1428,8 +1425,8 @@ static mp_obj_t s3lcd_init(mp_obj_t self_in) {
             .cs_gpio_num = config->cs_gpio_num,
             .pclk_hz = config->pclk_hz,
             .trans_queue_depth = 10,
-            .on_color_trans_done = lcd_panel_done,
-            .user_ctx = self,
+            .on_color_trans_done = frame_on_color_done,
+            .user_ctx = &self->frame,
             .dc_levels = {
                 .dc_idle_level = config->dc_levels.dc_idle_level,
                 .dc_cmd_level = config->dc_levels.dc_cmd_level,
@@ -1458,7 +1455,7 @@ static mp_obj_t s3lcd_init(mp_obj_t self_in) {
             .miso_io_num = -1,
             .quadwp_io_num = -1,
             .quadhd_io_num = -1,
-            .max_transfer_sz = self->dma_buffer_size
+            .max_transfer_sz = frame_max_transfer(&self->frame)
         };
         ESP_ERROR_CHECK(spi_bus_initialize(config->spi_host, &buscfg, SPI_DMA_CH_AUTO));
         esp_lcd_panel_io_handle_t io_handle = NULL;
@@ -1470,8 +1467,8 @@ static mp_obj_t s3lcd_init(mp_obj_t self_in) {
             .trans_queue_depth = 10,
             .lcd_cmd_bits = config->lcd_cmd_bits,
             .lcd_param_bits = config->lcd_param_bits,
-            .on_color_trans_done = lcd_panel_done,
-            .user_ctx = self,
+            .on_color_trans_done = frame_on_color_done,
+            .user_ctx = &self->frame,
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
             .flags.dc_as_cmd_phase = config->flags.dc_as_cmd_phase,
 #endif
@@ -1493,6 +1490,7 @@ static mp_obj_t s3lcd_init(mp_obj_t self_in) {
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(self->io_handle, &panel_config, &panel_handle));
     self->panel_handle = panel_handle;
+    frame_attach(&self->frame, panel_handle);
 
     esp_lcd_panel_reset(panel_handle);
     if (self->custom_init == MP_OBJ_NULL) {
@@ -1505,9 +1503,6 @@ static mp_obj_t s3lcd_init(mp_obj_t self_in) {
     }
     esp_lcd_panel_invert_color(panel_handle, self->inversion_mode);
     set_rotation(self);
-
-    self->frame_buffer = m_malloc(self->frame_buffer_size);
-    memset(self->frame_buffer, 0, self->frame_buffer_size);
 
     // esp_lcd_panel_io_tx_param(self->io_handle, 0x13, NULL, 0);
 
@@ -2595,57 +2590,14 @@ static mp_obj_t s3lcd_fill_polygon(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_fill_polygon_obj, 4, 9, s3lcd_fill_polygon);
 
 
-//
-// copy rows from the framebuffer to the dma buffer and send it to the display beginning at row.
-//
-//  self: s3lcd object
-//  src: pointer to the framebuffer
-//  row: row to start at
-//  rows: number of rows to send
-//  len: pixel data length to send
-
-unsigned char reverse(unsigned char b) {
-   b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
-   b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
-   b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
-   return b;
-}
-
-void s3lcd_dma_display(s3lcd_obj_t *self, uint16_t *src, uint16_t row, uint16_t rows, size_t len) {
-    uint16_t *dma_buffer = self->dma_buffer;
-    if (self->swap_color_bytes) {
-        for (size_t i = 0; i < len; i++) {
-            *dma_buffer++ = _swap_bytes(src[i]);
-        }
-    } else{
-        memcpy(self->dma_buffer, src, len * 2);
-    }
-
-    lcd_panel_active = true;
-    esp_lcd_panel_draw_bitmap(self->panel_handle, 0, row, self->width, row + rows, self->dma_buffer);
-    while (lcd_panel_active) {
-    }
-}
-
 ///
 /// .show()
-/// Show the framebuffer.
+/// Show the framebuffer. Raises OSError(ETIMEDOUT) when the send takes longer than config()'s timeout.
 ///
 
 static mp_obj_t s3lcd_show(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    size_t pixels = self->dma_rows * self->width;
-    uint16_t *fb = self->frame_buffer;
-    for (int y = 0; y < self->height - self->dma_rows + 1; y += self->dma_rows) {
-        s3lcd_dma_display(self, fb, y, self->dma_rows, pixels);
-        fb += pixels;
-    }
-
-    if (self->height % self->dma_rows != 0) {
-        size_t remaining = self->height % self->dma_rows;
-        s3lcd_dma_display(self, fb, (self->height - remaining), remaining, remaining * self->width);
-    }
-
+    frame_show(&self->frame, self->width, self->height);
     return mp_const_none;
 }
 
@@ -2659,36 +2611,48 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_show_obj, 1, 1, s3lcd_show);
 static mp_obj_t s3lcd_deinit(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
 
-    esp_lcd_panel_del(self->panel_handle);
-    self->panel_handle = NULL;
+    // First the frame: it waits until DMA stops reading its memory.
+    frame_free(&self->frame);
+    self->frame_buffer = NULL;
+    self->dma_buffer = NULL;
+    self->dma_buffer_size = 0;
 
-    esp_lcd_panel_io_del(self->io_handle);
-    self->io_handle = NULL;
-
-    if (mp_obj_is_type(self->bus, &s3lcd_i80_bus_type)) {
-        esp_lcd_del_i80_bus(self->bus_handle.i80);
-        self->bus_handle.i80 = NULL;
-    } else if (mp_obj_is_type(self->bus, &s3lcd_spi_bus_type)) {
-        s3lcd_spi_bus_obj_t *config = MP_OBJ_TO_PTR(self->bus);
-        spi_bus_free(config->spi_host);
-        self->bus_handle.spi = 0;  // IDF 5: the SPI bus handle is an int (the host id), not a pointer
+    // Also the finalizer, so a soft reset frees the bus and the next init() can claim it.
+    if (self->io_handle != NULL) {
+        esp_lcd_panel_del(self->panel_handle);
+        self->panel_handle = NULL;
+        esp_lcd_panel_io_del(self->io_handle);
+        self->io_handle = NULL;
+        if (mp_obj_is_type(self->bus, &s3lcd_i80_bus_type)) {
+            esp_lcd_del_i80_bus(self->bus_handle.i80);
+            self->bus_handle.i80 = NULL;
+        } else if (mp_obj_is_type(self->bus, &s3lcd_spi_bus_type)) {
+            s3lcd_spi_bus_obj_t *config = MP_OBJ_TO_PTR(self->bus);
+            spi_bus_free(config->spi_host);
+            self->bus_handle.spi = 0;  // IDF 5: the SPI bus handle is an int (the host id), not a pointer
+        }
     }
 
     m_free(self->work);
     self->work = NULL;
-
-    m_free(self->frame_buffer);
-    self->frame_buffer = NULL;
-    self->frame_buffer_size = 0;
-
-    free(self->dma_buffer);
-    self->dma_buffer = NULL;
-    self->dma_buffer_size = 0;
-    self->dma_rows = 0;
-
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_deinit_obj, 1, 1, s3lcd_deinit);
+
+///
+/// .config({timeout=ms, framebuffer="dma"|"strips"})
+/// Set the settings given, all or none, and return every setting as a dict.
+/// -- timeout: the longest wait for show(), 1 to 60000 ms; past it show() raises OSError(ETIMEDOUT). Default 100.
+/// -- framebuffer: "dma" keeps the frame in internal DMA RAM and sends it with no copy; "strips" keeps it
+///    in PSRAM and copies it through two internal strips. Set it before init(). Default "dma"; when no
+///    internal block is large enough, or the bus swaps bytes, init() prints a notice and uses "strips".
+///
+
+static mp_obj_t s3lcd_config(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    s3lcd_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    return frame_config(&self->frame, n_args - 1, pos_args + 1, kw_args);
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(s3lcd_config_obj, 1, s3lcd_config);
 
 static const mp_rom_map_elem_t s3lcd_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_write), MP_ROM_PTR(&s3lcd_write_obj)},
@@ -2728,6 +2692,8 @@ static const mp_rom_map_elem_t s3lcd_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_fill_polygon), MP_ROM_PTR(&s3lcd_fill_polygon_obj)},
     {MP_ROM_QSTR(MP_QSTR_show), MP_ROM_PTR(&s3lcd_show_obj)},
     {MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&s3lcd_deinit_obj)},
+    {MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&s3lcd_deinit_obj)},
+    {MP_ROM_QSTR(MP_QSTR_config), MP_ROM_PTR(&s3lcd_config_obj)},
 };
 static MP_DEFINE_CONST_DICT(s3lcd_locals_dict, s3lcd_locals_dict_table);
 /* methods end */
@@ -2822,8 +2788,7 @@ mp_obj_t s3lcd_make_new(const mp_obj_type_t *type,
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     // create new object
-    s3lcd_obj_t *self = m_new_obj(s3lcd_obj_t);
-    self->base.type = &s3lcd_type;
+    s3lcd_obj_t *self = mp_obj_malloc_with_finaliser(s3lcd_obj_t, &s3lcd_type);
     self->bus = args[ARG_bus].u_obj;
 
     // set s3lcd parameters
@@ -2831,14 +2796,14 @@ mp_obj_t s3lcd_make_new(const mp_obj_type_t *type,
     self->width = args[ARG_width].u_int;
     self->height = args[ARG_height].u_int;
 
-    uint16_t longest_axis = ((self->width > self->height) ? self->width : self->height);
+    // The frame's memory comes at init(), so that config() can choose it first.
     self->dma_rows = args[ARG_dma_rows].u_int;
-    self->dma_buffer_size = self->dma_rows * longest_axis * 2;
-    self->dma_buffer = heap_caps_malloc(self->dma_buffer_size, MALLOC_CAP_DMA);
-    memset(self->dma_buffer, 0, self->dma_buffer_size);
-    if (self->dma_buffer == NULL) {
-        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to allocate DMA buffer"));
-    }
+    frame_defaults(&self->frame, self->dma_rows);
+    self->dma_buffer = NULL;
+    self->dma_buffer_size = 0;
+    self->io_handle = NULL;
+    self->panel_handle = NULL;
+    self->work = NULL;
 
     self->rotations = set_rotations(self->width, self->height);
     self->rotations_len = 4;

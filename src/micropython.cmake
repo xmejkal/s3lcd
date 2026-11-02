@@ -4,6 +4,7 @@ add_library(usermod_s3lcd INTERFACE)
 # Add our source files to the lib
 target_sources(usermod_s3lcd INTERFACE
     ${CMAKE_CURRENT_LIST_DIR}/s3lcd.c
+    ${CMAKE_CURRENT_LIST_DIR}/frame.c
     ${CMAKE_CURRENT_LIST_DIR}/s3lcd_i80_bus.c
     ${CMAKE_CURRENT_LIST_DIR}/s3lcd_spi_bus.c
     ${CMAKE_CURRENT_LIST_DIR}/mpfile.c
