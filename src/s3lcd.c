@@ -579,6 +579,8 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_line_obj, 6, 7, s3lcd_line);
 /// -- height: height of the image
 /// optional parameters:
 /// -- alpha defaults to 255
+/// -- key: a colour, as stored in the buffer, whose pixels are skipped (a sprite's
+///    clear colour); -1, the default, skips none
 ///
 
 static mp_obj_t s3lcd_blit_buffer(size_t n_args, const mp_obj_t *args) {
@@ -590,9 +592,37 @@ static mp_obj_t s3lcd_blit_buffer(size_t n_args, const mp_obj_t *args) {
     mp_int_t w = mp_obj_get_int(args[4]);
     mp_int_t h = mp_obj_get_int(args[5]);
     OPTIONAL_ARG(6, mp_int_t, mp_obj_get_int, alpha, 255)
+    OPTIONAL_ARG(7, mp_int_t, mp_obj_get_int, key, -1)
 
+    if (w <= 0 || h <= 0) {  // nothing to draw, as before
+        return mp_const_none;
+    }
+    if ((size_t)w > buf_info.len / 2 / (size_t)h) {  // divided, so a large w * h cannot wrap
+        mp_raise_ValueError(MP_ERROR_TEXT("buffer smaller than width * height * 2"));
+    }
     frame_dirty(&self->frame, MAX(x, 0), MAX(y, 0), MIN(x + w, self->width), MIN(y + h, self->height));
     uint16_t *src = buf_info.buf;
+
+    // P562: a picture wholly on the screen at full alpha, the common case for the
+    // painted background and the sprites, is copied by rows: memcpy when no key is
+    // given, else every pixel but the key. Measured before: 9.65 ms for a full frame.
+    if (alpha == 255 && x >= 0 && y >= 0 && x <= self->width - w && y <= self->height - h) {  // no x + w: it can wrap
+        for (int yy = 0; yy < h; yy++) {
+            uint16_t *d = (uint16_t *) self->frame_buffer + ((y + yy) * self->width + x);
+            if (key < 0) {
+                memcpy(d, src, (size_t)w * 2);
+                src += w;
+            } else {
+                for (int xx = 0; xx < w; xx++, src++, d++) {
+                    if (*src != (uint16_t)key) {
+                        *d = *src;
+                    }
+                }
+            }
+        }
+        return mp_const_none;
+    }
+
     uint16_t stride = self->width - w;
     uint16_t *dst = (uint16_t *) self->frame_buffer + (y * self->width + x);
 
@@ -603,7 +633,9 @@ static mp_obj_t s3lcd_blit_buffer(size_t n_args, const mp_obj_t *args) {
                 dst++;
             }
             else {
-                *dst = alpha_blend_565(*src, *dst, alpha);
+                if (key < 0 || *src != (uint16_t)key) {
+                    *dst = alpha_blend_565(*src, *dst, alpha);
+                }
                 src++;
                 dst++;
             }
@@ -613,7 +645,7 @@ static mp_obj_t s3lcd_blit_buffer(size_t n_args, const mp_obj_t *args) {
 
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_blit_buffer_obj, 6, 7, s3lcd_blit_buffer);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_blit_buffer_obj, 6, 8, s3lcd_blit_buffer);
 
 ///
 /// .draw(font, string|int, x, y, {color , scale, alpha})
