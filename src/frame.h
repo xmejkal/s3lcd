@@ -24,7 +24,7 @@ typedef enum {
 
 // The settings Python sets through config().
 typedef struct {
-    uint32_t timeout_ms;        // the longest wait for a send; past it show() raises
+    uint32_t timeout_ms;        // the longest time one show() may take; past it show() raises
     frame_memory_t memory;      // asked for; read at init()
 } frame_config_t;
 

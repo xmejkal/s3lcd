@@ -29,6 +29,12 @@
 #define FRAME_ISR
 #endif
 
+// portYIELD_FROM_ISR calls this trace hook. FreeRTOS.h gives its empty default
+// only under ESP_PLATFORM, which MicroPython's user C modules do not define.
+#ifndef traceISR_EXIT_TO_SCHEDULER
+#define traceISR_EXIT_TO_SCHEDULER()
+#endif
+
 // Before init(): the default settings and no memory yet.
 void frame_defaults(frame_t *frame, uint16_t strip_rows) {
     memset(frame, 0, sizeof(*frame));
@@ -114,12 +120,12 @@ static TickType_t frame_ticks(uint32_t ms) {
     return (ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS;
 }
 
-// True when at most `most` windows are in flight within the timeout. The
+// True when at most `most` windows are in flight before the timeout, counted
+// from `start`: one show() has one deadline, however many waits it makes. The
 // interrupt gives the semaphore after every window, and a give can be left
 // over from an earlier frame, so the count decides, never the give alone.
-static bool frame_wait(frame_t *frame, int most) {
+static bool frame_wait(frame_t *frame, int most, TickType_t start) {
     TickType_t limit = frame_ticks(frame->config.timeout_ms);
-    TickType_t start = xTaskGetTickCount();
     while (frame->in_flight > most) {
         TickType_t spent = xTaskGetTickCount() - start;
         bool given = spent < limit && xSemaphoreTake(frame->done, limit - spent) == pdTRUE;
@@ -130,8 +136,8 @@ static bool frame_wait(frame_t *frame, int most) {
     return true;
 }
 
-static void frame_wait_or_raise(frame_t *frame, int most) {
-    if (!frame_wait(frame, most)) {
+static void frame_wait_or_raise(frame_t *frame, int most, TickType_t start) {
+    if (!frame_wait(frame, most, start)) {
         mp_raise_OSError(MP_ETIMEDOUT);
     }
 }
@@ -160,13 +166,13 @@ static void frame_copy(const frame_t *frame, uint16_t *dst, const uint16_t *src,
 // The PSRAM frame, strip by strip: the copy of one strip overlaps the send of
 // the other. Windows end in order, so when at most one is in flight, the
 // window that used this strip two steps back has ended.
-static void frame_send_strips(frame_t *frame, uint16_t width, uint16_t height) {
+static void frame_send_strips(frame_t *frame, uint16_t width, uint16_t height, TickType_t start) {
     const uint16_t *src = frame->pixels;
     for (uint16_t y = 0, k = 0; y < height; y += frame->strip_rows, k++) {
         uint16_t rows = height - y < frame->strip_rows ? height - y : frame->strip_rows;
         size_t count = (size_t)rows * width;
         uint16_t *strip = frame->strips[k % FRAME_STRIP_COUNT];
-        frame_wait_or_raise(frame, FRAME_OTHER_STRIP);
+        frame_wait_or_raise(frame, FRAME_OTHER_STRIP, start);
         frame_copy(frame, strip, src, count);
         frame_send(frame, width, y, y + rows, strip);
         src += count;
@@ -175,15 +181,16 @@ static void frame_send_strips(frame_t *frame, uint16_t width, uint16_t height) {
 
 // Send the whole framebuffer, and return when the panel has all of it.
 void frame_show(frame_t *frame, uint16_t width, uint16_t height) {
+    TickType_t start = xTaskGetTickCount();
     // A window of a frame that timed out can still end now. Wait for it first,
     // so that it cannot count as a window of this frame.
-    frame_wait_or_raise(frame, FRAME_ALL_SENT);
+    frame_wait_or_raise(frame, FRAME_ALL_SENT, start);
     if (frame->memory == FRAME_IN_DMA) {
         frame_send(frame, width, 0, height, frame->pixels);
     } else {
-        frame_send_strips(frame, width, height);
+        frame_send_strips(frame, width, height, start);
     }
-    frame_wait_or_raise(frame, FRAME_ALL_SENT);
+    frame_wait_or_raise(frame, FRAME_ALL_SENT, start);
 }
 
 // At deinit() or at a soft reset, through the finalizer, so it never raises.
@@ -191,7 +198,7 @@ void frame_show(frame_t *frame, uint16_t width, uint16_t height) {
 // If the bus is dead, that wait times out and the memory is freed anyway.
 void frame_free(frame_t *frame) {
     if (frame->done != NULL) {
-        frame_wait(frame, FRAME_ALL_SENT);
+        frame_wait(frame, FRAME_ALL_SENT, xTaskGetTickCount());
         vSemaphoreDelete(frame->done);
         frame->done = NULL;
     }

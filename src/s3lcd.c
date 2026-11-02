@@ -2642,7 +2642,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_deinit_obj, 1, 1, s3lcd_deinit)
 ///
 /// .config({timeout=ms, framebuffer="dma"|"strips"})
 /// Set the settings given, all or none, and return every setting as a dict.
-/// -- timeout: the longest wait for show(), 1 to 60000 ms; past it show() raises OSError(ETIMEDOUT). Default 100.
+/// -- timeout: the longest time one show() may take, 1 to 60000 ms; past it show() raises OSError(ETIMEDOUT). Default 100.
 /// -- framebuffer: "dma" keeps the frame in internal DMA RAM and sends it with no copy; "strips" keeps it
 ///    in PSRAM and copies it through two internal strips. Set it before init(). Default "dma"; when no
 ///    internal block is large enough, or the bus swaps bytes, init() prints a notice and uses "strips".
