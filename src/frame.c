@@ -43,13 +43,16 @@
 #define traceISR_EXIT_TO_SCHEDULER()
 #endif
 
-// Before init(): the default settings and no memory yet.
-void frame_defaults(frame_t *frame, uint16_t strip_rows) {
+// Before init(): the default settings and no memory yet. The swap's default
+// is the bus's swap_color_bytes flag; config(swap=...) overrides it.
+void frame_defaults(frame_t *frame, uint16_t strip_rows, bool swap) {
     memset(frame, 0, sizeof(*frame));
     frame->config.timeout_ms = FRAME_TIMEOUT_MS;
     frame->config.memory = FRAME_IN_DMA;
     frame->config.tile_shift = FRAME_TILE_SHIFT;
     frame->config.windows = FRAME_WINDOWS;
+    frame->config.swap = swap;
+    frame->defaults = frame->config;
     frame->strip_rows = strip_rows;
     frame->tracking = true;
     portMUX_INITIALIZE(&frame->lock);
@@ -80,11 +83,10 @@ static void frame_alloc_marks(frame_t *frame, uint16_t longest_axis) {
 // At init(), before the bus: the framebuffer first, so that it gets the
 // largest internal block, then the strips. "dma" falls back to "strips" with a
 // notice when the swap needs a copy or no block is large enough.
-void frame_alloc(frame_t *frame, uint16_t width, uint16_t height, bool swap) {
-    frame->swap = swap;
+void frame_alloc(frame_t *frame, uint16_t width, uint16_t height) {
     frame->size = (size_t)width * height * sizeof(uint16_t);
     frame->memory = frame->config.memory;
-    if (frame->memory == FRAME_IN_DMA && swap) {
+    if (frame->memory == FRAME_IN_DMA && frame->config.swap) {
         mp_printf(&mp_plat_print, "frame: a byte swap needs a copy, so framebuffer=\"strips\"\n");
         frame->memory = FRAME_IN_STRIPS;
     }
@@ -199,7 +201,7 @@ static void frame_queue(frame_t *frame, frame_rect_t rect, const uint16_t *src) 
 }
 
 static void frame_copy(const frame_t *frame, uint16_t *dst, const uint16_t *src, size_t count) {
-    if (!frame->swap) {
+    if (!frame->config.swap) {
         memcpy(dst, src, count * sizeof(uint16_t));
         return;
     }
@@ -366,18 +368,53 @@ void frame_free(frame_t *frame) {
     frame->marks = NULL;
 }
 
-static uint32_t frame_parse_timeout(mp_obj_t value) {
-    mp_int_t ms = mp_obj_get_int(value);
-    if (ms < 1 || ms > FRAME_TIMEOUT_MAX_MS) {
-        mp_raise_ValueError(MP_ERROR_TEXT("timeout must be 1 to 60000 ms"));
+// The settings config() knows, in the order of its dict.
+static const qstr frame_keys[] = {
+    MP_QSTR_timeout, MP_QSTR_framebuffer, MP_QSTR_partial, MP_QSTR_tile, MP_QSTR_windows, MP_QSTR_swap,
+    MP_QSTR_defaults,
+};
+
+// An unknown key names itself: mp_arg_parse_all's own error does not, in
+// this build's terse error text.
+static void frame_check_keys(const mp_map_t *kw_args) {
+    for (size_t i = 0; i < kw_args->alloc; i++) {
+        if (!mp_map_slot_is_filled(kw_args, i)) {
+            continue;
+        }
+        qstr key = mp_obj_str_get_qstr(kw_args->table[i].key);
+        bool known = false;
+        for (size_t k = 0; k < MP_ARRAY_SIZE(frame_keys); k++) {
+            known = known || key == frame_keys[k];
+        }
+        if (!known) {
+            mp_raise_msg_varg(&mp_type_TypeError, MP_ERROR_TEXT("config() has no setting '%q'"), key);
+        }
     }
-    return (uint32_t)ms;
+}
+
+// An int in lo to hi, or a ValueError with the message that names the key.
+static mp_int_t frame_parse_int(mp_obj_t value, mp_int_t lo, mp_int_t hi, mp_rom_error_text_t message) {
+    if (!mp_obj_is_int(value) || mp_obj_is_bool(value)) {
+        mp_raise_ValueError(message);
+    }
+    mp_int_t n = mp_obj_get_int(value);
+    if (n < lo || n > hi) {
+        mp_raise_ValueError(message);
+    }
+    return n;
+}
+
+static bool frame_parse_bool(mp_obj_t value, mp_rom_error_text_t message) {
+    if (!mp_obj_is_bool(value)) {
+        mp_raise_ValueError(message);
+    }
+    return value == mp_const_true;
 }
 
 // After init() the memory is fixed. The value in use, or the one asked for,
 // is still accepted, so that config(**config()) works.
 static frame_memory_t frame_parse_memory(const frame_t *frame, mp_obj_t value) {
-    qstr name = mp_obj_str_get_qstr(value);
+    qstr name = mp_obj_is_str(value) ? mp_obj_str_get_qstr(value) : MP_QSTRnull;
     frame_memory_t memory;
     if (name == MP_QSTR_dma) {
         memory = FRAME_IN_DMA;
@@ -395,21 +432,52 @@ static frame_memory_t frame_parse_memory(const frame_t *frame, mp_obj_t value) {
 
 // 8, 16 or 32 px, kept as its shift, so a mark costs no division.
 static uint8_t frame_parse_tile(mp_obj_t value) {
-    mp_int_t tile = mp_obj_get_int(value);
+    mp_rom_error_text_t message = MP_ERROR_TEXT("tile must be 8, 16 or 32");
+    mp_int_t tile = frame_parse_int(value, 1 << FRAME_TILE_SHIFT_MIN, 1 << FRAME_TILE_SHIFT_MAX, message);
     for (int shift = FRAME_TILE_SHIFT_MIN; shift <= FRAME_TILE_SHIFT_MAX; shift++) {
         if (tile == 1 << shift) {
             return shift;
         }
     }
-    mp_raise_ValueError(MP_ERROR_TEXT("tile must be 8, 16 or 32"));
+    mp_raise_ValueError(message);
 }
 
-static uint8_t frame_parse_windows(mp_obj_t value) {
-    mp_int_t windows = mp_obj_get_int(value);
-    if (windows < 1 || windows > FRAME_WINDOWS_MAX) {
-        mp_raise_ValueError(MP_ERROR_TEXT("windows must be 1 to 64"));
+// An internal framebuffer goes out with no copy, so nothing can swap it.
+static bool frame_parse_swap(const frame_t *frame, mp_obj_t value) {
+    bool swap = frame_parse_bool(value, MP_ERROR_TEXT("swap must be True or False"));
+    if (swap && frame->pixels != NULL && frame->memory == FRAME_IN_DMA) {
+        mp_raise_ValueError(MP_ERROR_TEXT("swap needs framebuffer=\"strips\"; set both before init()"));
     }
-    return (uint8_t)windows;
+    return swap;
+}
+
+// Each value given, checked; the rest as they are, or the defaults first.
+static frame_config_t frame_parse(const frame_t *frame, const mp_arg_val_t *args) {
+    enum { ARG_timeout, ARG_framebuffer, ARG_partial, ARG_tile, ARG_windows, ARG_swap, ARG_defaults };
+    bool restore = args[ARG_defaults].u_obj != MP_OBJ_NULL
+        && frame_parse_bool(args[ARG_defaults].u_obj, MP_ERROR_TEXT("defaults must be True or False"));
+    frame_config_t next = restore ? frame->defaults : frame->config;
+    if (args[ARG_timeout].u_obj != MP_OBJ_NULL) {
+        next.timeout_ms = frame_parse_int(args[ARG_timeout].u_obj, 1, FRAME_TIMEOUT_MAX_MS,
+            MP_ERROR_TEXT("timeout must be 1 to 60000 ms"));
+    }
+    if (args[ARG_framebuffer].u_obj != MP_OBJ_NULL) {
+        next.memory = frame_parse_memory(frame, args[ARG_framebuffer].u_obj);
+    }
+    if (args[ARG_partial].u_obj != MP_OBJ_NULL) {
+        next.partial = frame_parse_bool(args[ARG_partial].u_obj, MP_ERROR_TEXT("partial must be True or False"));
+    }
+    if (args[ARG_tile].u_obj != MP_OBJ_NULL) {
+        next.tile_shift = frame_parse_tile(args[ARG_tile].u_obj);
+    }
+    if (args[ARG_windows].u_obj != MP_OBJ_NULL) {
+        next.windows = frame_parse_int(args[ARG_windows].u_obj, 1, FRAME_WINDOWS_MAX,
+            MP_ERROR_TEXT("windows must be 1 to 64"));
+    }
+    if (args[ARG_swap].u_obj != MP_OBJ_NULL) {
+        next.swap = frame_parse_swap(frame, args[ARG_swap].u_obj);
+    }
+    return next;
 }
 
 // After init() it reports the memory in use, which differs after a fallback.
@@ -422,39 +490,26 @@ static mp_obj_t frame_config_dict(const frame_t *frame) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_partial), mp_obj_new_bool(frame->config.partial));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_tile), mp_obj_new_int(1 << frame->config.tile_shift));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_windows), mp_obj_new_int(frame->config.windows));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_swap), mp_obj_new_bool(frame->config.swap));
     return dict;
 }
 
 // config(**settings): check every value given, then apply them all, so that a
 // bad one changes nothing. Returns every setting as a dict.
 mp_obj_t frame_config(frame_t *frame, size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_timeout, ARG_framebuffer, ARG_partial, ARG_tile, ARG_windows };
     static const mp_arg_t allowed_args[] = {
         {MP_QSTR_timeout, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
         {MP_QSTR_framebuffer, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
         {MP_QSTR_partial, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
         {MP_QSTR_tile, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
         {MP_QSTR_windows, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
+        {MP_QSTR_swap, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
+        {MP_QSTR_defaults, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
     };
+    frame_check_keys(kw_args);
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
-
-    frame_config_t next = frame->config;
-    if (args[ARG_timeout].u_obj != MP_OBJ_NULL) {
-        next.timeout_ms = frame_parse_timeout(args[ARG_timeout].u_obj);
-    }
-    if (args[ARG_framebuffer].u_obj != MP_OBJ_NULL) {
-        next.memory = frame_parse_memory(frame, args[ARG_framebuffer].u_obj);
-    }
-    if (args[ARG_partial].u_obj != MP_OBJ_NULL) {
-        next.partial = mp_obj_is_true(args[ARG_partial].u_obj);
-    }
-    if (args[ARG_tile].u_obj != MP_OBJ_NULL) {
-        next.tile_shift = frame_parse_tile(args[ARG_tile].u_obj);
-    }
-    if (args[ARG_windows].u_obj != MP_OBJ_NULL) {
-        next.windows = frame_parse_windows(args[ARG_windows].u_obj);
-    }
+    frame_config_t next = frame_parse(frame, args);
     // Marks made at the old tile size point at the wrong tiles.
     bool retiled = next.tile_shift != frame->config.tile_shift;
     frame->config = next;

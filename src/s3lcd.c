@@ -1404,9 +1404,7 @@ static mp_obj_t s3lcd_init(mp_obj_t self_in) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     // The frame comes before the bus: its memory sets the bus's largest transfer.
-    bool swap = mp_obj_is_type(self->bus, &s3lcd_spi_bus_type)
-        && ((s3lcd_spi_bus_obj_t *)MP_OBJ_TO_PTR(self->bus))->flags.swap_color_bytes;
-    frame_alloc(&self->frame, self->width, self->height, swap);
+    frame_alloc(&self->frame, self->width, self->height);
     self->frame_buffer = self->frame.pixels;
     self->dma_buffer = self->frame.strips[0];
     self->dma_buffer_size = self->frame.strip_size;
@@ -2657,8 +2655,10 @@ static mp_obj_t s3lcd_deinit(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_deinit_obj, 1, 1, s3lcd_deinit);
 
 ///
-/// .config({timeout=ms, framebuffer="dma"|"strips", partial=bool, tile=px, windows=n})
-/// Set the settings given, all or none, and return every setting as a dict.
+/// .config({timeout=ms, framebuffer="dma"|"strips", partial=bool, tile=px, windows=n, swap=bool, defaults=bool})
+/// Set the settings given, all or none, and return every setting as a dict. config() only reads.
+/// An unknown key raises TypeError naming it. A bad value raises ValueError naming the key and what it allows,
+/// and a setting that needs init() again, given after init(), raises ValueError saying so.
 /// -- timeout: the longest time one show() may take, 1 to 60000 ms; past it show() raises OSError(ETIMEDOUT). Default 100.
 /// -- framebuffer: "dma" keeps the frame in internal DMA RAM and sends it with no copy; "strips" keeps it
 ///    in PSRAM and copies it through two internal strips. Set it before init(). Default "dma"; when no
@@ -2666,6 +2666,8 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_deinit_obj, 1, 1, s3lcd_deinit)
 /// -- partial: show() sends only the tiles drawn in this frame or the one before. Default False.
 /// -- tile: the tile's side, 8, 16 or 32 px. Default 16.
 /// -- windows: past this many rectangles of changed tiles, show() sends the whole frame. 1 to 64, default 40.
+/// -- swap: swap the two bytes of each pixel on send. Needs "strips". Default: the bus's swap_color_bytes.
+/// -- defaults: True restores every setting first, then applies the others given.
 ///
 
 static mp_obj_t s3lcd_config(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
@@ -2834,7 +2836,9 @@ mp_obj_t s3lcd_make_new(const mp_obj_type_t *type,
 
     // The frame's memory comes at init(), so that config() can choose it first.
     self->dma_rows = args[ARG_dma_rows].u_int;
-    frame_defaults(&self->frame, self->dma_rows);
+    bool swap = mp_obj_is_type(self->bus, &s3lcd_spi_bus_type)
+        && ((s3lcd_spi_bus_obj_t *)MP_OBJ_TO_PTR(self->bus))->flags.swap_color_bytes;
+    frame_defaults(&self->frame, self->dma_rows, swap);
     self->dma_buffer = NULL;
     self->dma_buffer_size = 0;
     self->io_handle = NULL;

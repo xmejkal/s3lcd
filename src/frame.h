@@ -29,6 +29,7 @@ typedef struct {
     bool partial;               // send only the tiles that changed, not the whole frame
     uint8_t tile_shift;         // a tile is 1 << tile_shift pixels square
     uint8_t windows;            // past this many windows, show() sends the whole frame instead
+    bool swap;                  // swap the two bytes of each pixel on send; needs "strips"
 } frame_config_t;
 
 // The marks of one tile: drawn in this frame, drawn in the frame before.
@@ -37,9 +38,9 @@ typedef struct {
 
 typedef struct {
     frame_config_t config;
+    frame_config_t defaults;        // what config(defaults=True) restores
     frame_memory_t memory;          // in use since init(); differs from config.memory after a fallback
     esp_lcd_panel_handle_t panel;
-    bool swap;                      // swap the two bytes of each pixel on send (strips only)
     uint16_t *pixels;               // the framebuffer
     size_t size;                    // its size in bytes
     uint16_t *strips[2];            // internal DMA buffers: the copy of one overlaps the send of the other
@@ -69,8 +70,8 @@ static inline void frame_dirty(frame_t *frame, int x0, int y0, int x1, int y1) {
     }
 }
 
-void frame_defaults(frame_t *frame, uint16_t strip_rows);
-void frame_alloc(frame_t *frame, uint16_t width, uint16_t height, bool swap);
+void frame_defaults(frame_t *frame, uint16_t strip_rows, bool swap);
+void frame_alloc(frame_t *frame, uint16_t width, uint16_t height);
 size_t frame_max_transfer(const frame_t *frame);
 void frame_attach(frame_t *frame, esp_lcd_panel_handle_t panel);
 bool frame_on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
