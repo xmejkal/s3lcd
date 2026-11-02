@@ -117,7 +117,7 @@ static mp_obj_t s3lcd_i80_bus_make_new(const mp_obj_type_t *type, size_t n_args,
     // data bus
     mp_obj_tuple_t *t = MP_OBJ_TO_PTR(args[ARG_data].u_obj);
     if (t->len > 16) {
-        mp_raise_ValueError("data bus width must be <= 16");
+        mp_raise_ValueError(MP_ERROR_TEXT("data bus width must be <= 16"));
     }
 
     self->bus_width = t->len;

@@ -2671,7 +2671,7 @@ static mp_obj_t s3lcd_deinit(size_t n_args, const mp_obj_t *args) {
     } else if (mp_obj_is_type(self->bus, &s3lcd_spi_bus_type)) {
         s3lcd_spi_bus_obj_t *config = MP_OBJ_TO_PTR(self->bus);
         spi_bus_free(config->spi_host);
-        self->bus_handle.spi = NULL;
+        self->bus_handle.spi = 0;  // IDF 5: the SPI bus handle is an int (the host id), not a pointer
     }
 
     m_free(self->work);
