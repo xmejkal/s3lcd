@@ -2609,13 +2609,13 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_fill_polygon_obj, 4, 9, s3lcd_f
 
 ///
 /// .show()
-/// Show the framebuffer: all of it, or with config(partial=True) the tiles that changed. Raises OSError(ETIMEDOUT) when the send takes longer than config()'s timeout.
+/// Show the framebuffer: all of it, or with config(partial=True) the tiles that changed. Returns the count of
+/// windows sent, strip loads included; each costs bus setup. Raises OSError(ETIMEDOUT) when the send takes longer than config()'s timeout.
 ///
 
 static mp_obj_t s3lcd_show(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    frame_show(&self->frame, self->width, self->height);
-    return mp_const_none;
+    return mp_obj_new_int(frame_show(&self->frame, self->width, self->height));
 }
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_show_obj, 1, 1, s3lcd_show);
@@ -2800,6 +2800,7 @@ mp_obj_t s3lcd_make_new(const mp_obj_type_t *type,
         ARG_custom_init,
         ARG_color_space,
         ARG_inversion_mode,
+        ARG_idle_mode,      // upstream lacked it, so dma_rows read idle_mode (1) and options read dma_rows
         ARG_dma_rows,
         ARG_options,
     };

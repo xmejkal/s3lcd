@@ -50,6 +50,7 @@ typedef struct {
     SemaphoreHandle_t done;         // given by the interrupt each time a window ends
     uint8_t *marks;                 // one byte per tile at the smallest tile size, FRAME_MARK_* bits
     uint16_t grid;                  // tiles per row of marks: the longest axis over the smallest tile
+    uint16_t queued;                // windows the last show() queued, strip loads included
     bool tracking;                  // draws mark their tiles; off while Python repaints the still picture
 } frame_t;
 
@@ -74,7 +75,7 @@ size_t frame_max_transfer(const frame_t *frame);
 void frame_attach(frame_t *frame, esp_lcd_panel_handle_t panel);
 bool frame_on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx);
 void frame_dirty_all(frame_t *frame);
-void frame_show(frame_t *frame, uint16_t width, uint16_t height);
+uint16_t frame_show(frame_t *frame, uint16_t width, uint16_t height);
 void frame_free(frame_t *frame);
 mp_obj_t frame_config(frame_t *frame, size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args);
 

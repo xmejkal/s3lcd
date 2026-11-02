@@ -190,6 +190,7 @@ typedef struct {
 // the window before draw_bitmap returns.
 static void frame_queue(frame_t *frame, frame_rect_t rect, const uint16_t *src) {
     frame_count(frame, +1);
+    frame->queued++;
     esp_err_t err = esp_lcd_panel_draw_bitmap(frame->panel, rect.x0, rect.y0, rect.x1, rect.y1, src);
     if (err != ESP_OK) {
         frame_count(frame, -1);
@@ -316,9 +317,11 @@ void frame_dirty_all(frame_t *frame) {
     memset(frame->marks, FRAME_MARK_NOW, (size_t)frame->grid * frame->grid);
 }
 
-// Send what changed, or the whole frame, and return when the panel has all of it.
-void frame_show(frame_t *frame, uint16_t width, uint16_t height) {
+// Send what changed, or the whole frame, and return when the panel has all of
+// it. Returns the count of windows queued: each costs bus setup.
+uint16_t frame_show(frame_t *frame, uint16_t width, uint16_t height) {
     frame_send_t send = {frame, width, xTaskGetTickCount(), 0};
+    frame->queued = 0;
     // A window of a frame that timed out can still end now. Wait for it first,
     // so that it cannot count as a window of this frame.
     frame_wait_or_raise(frame, FRAME_ALL_SENT, send.start);
@@ -335,6 +338,7 @@ void frame_show(frame_t *frame, uint16_t width, uint16_t height) {
     }
     frame_wait_or_raise(frame, FRAME_ALL_SENT, send.start);
     frame_age_marks(frame);
+    return frame->queued;
 }
 
 // At deinit() or at a soft reset, through the finalizer, so it never raises.
