@@ -34,6 +34,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "esp_lcd_panel_commands.h"
 #include "esp_lcd_panel_io.h"
@@ -2918,6 +2919,35 @@ mp_obj_t s3lcd_make_new(const mp_obj_type_t *type,
     return MP_OBJ_FROM_PTR(self);
 }
 
+// P562: one block of PSRAM outside MicroPython's heap, for the painted pictures.
+// The collector scans every live block of its heap, so 733 KB of pictures there
+// made each collection cost about 90 ms. It skips memory outside its heap. The
+// block is kept for the life of the board and handed out again after a soft
+// reset, so repeated runs do not leak it.
+static uint8_t *pool = NULL;
+static size_t pool_size = 0;
+
+/// .pool(size)
+/// A bytearray of size bytes over PSRAM that the collector does not scan. The
+/// same block on every call; a larger size than the first raises ValueError.
+static mp_obj_t s3lcd_pool(mp_obj_t size_in) {
+    mp_int_t size = mp_obj_get_int(size_in);
+    if (size <= 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("size must be above 0"));
+    }
+    if (pool == NULL) {
+        pool = heap_caps_malloc((size_t)size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (pool == NULL) {
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no PSRAM for the pool"));
+        }
+        pool_size = (size_t)size;
+    } else if ((size_t)size > pool_size) {
+        mp_raise_ValueError(MP_ERROR_TEXT("the pool is smaller: reset the board"));
+    }
+    return mp_obj_new_bytearray_by_ref((size_t)size, pool);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(s3lcd_pool_obj, s3lcd_pool);
+
 static const mp_map_elem_t s3lcd_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR___name__), MP_OBJ_NEW_QSTR(MP_QSTR_s3lcd)},
     {MP_ROM_QSTR(MP_QSTR_color565), (mp_obj_t)&s3lcd_color565_obj},
@@ -2925,6 +2955,7 @@ static const mp_map_elem_t s3lcd_module_globals_table[] = {
     {MP_ROM_QSTR(MP_QSTR_ESPLCD), (mp_obj_t)&s3lcd_type},
     {MP_ROM_QSTR(MP_QSTR_I80_BUS), (mp_obj_t)&s3lcd_i80_bus_type},
     {MP_ROM_QSTR(MP_QSTR_SPI_BUS), (mp_obj_t)&s3lcd_spi_bus_type},
+    {MP_ROM_QSTR(MP_QSTR_pool), (mp_obj_t)&s3lcd_pool_obj},
 
     {MP_ROM_QSTR(MP_QSTR_RGB), MP_ROM_INT(ESP_LCD_COLOR_SPACE_RGB)},
     {MP_ROM_QSTR(MP_QSTR_BGR), MP_ROM_INT(ESP_LCD_COLOR_SPACE_BGR)},
