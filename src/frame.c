@@ -84,6 +84,9 @@ static void frame_alloc_marks(frame_t *frame, uint16_t longest_axis) {
 // largest internal block, then the strips. "dma" falls back to "strips" with a
 // notice when the swap needs a copy or no block is large enough.
 void frame_alloc(frame_t *frame, uint16_t width, uint16_t height) {
+    if (frame->pixels != NULL) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("init() again: call deinit() first"));
+    }
     frame->size = (size_t)width * height * sizeof(uint16_t);
     frame->memory = frame->config.memory;
     if (frame->memory == FRAME_IN_DMA && frame->config.swap) {
@@ -131,7 +134,9 @@ FRAME_ISR bool frame_on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_i
     portENTER_CRITICAL_ISR(&frame->lock);
     frame->in_flight--;
     portEXIT_CRITICAL_ISR(&frame->lock);
-    xSemaphoreGiveFromISR(frame->done, &woken);
+    if (frame->done != NULL) {      // deinit() deletes the bus first; this guards any other order
+        xSemaphoreGiveFromISR(frame->done, &woken);
+    }
     portYIELD_FROM_ISR(woken);
     return woken == pdTRUE;
 }
@@ -142,9 +147,10 @@ static void frame_count(frame_t *frame, int change) {
     portEXIT_CRITICAL(&frame->lock);
 }
 
-// Rounded up, so that a 1 ms timeout waits one tick and not zero.
+// Rounded up, plus one tick: the start is read part way through a tick, so
+// without it a 1 ms timeout could end before any time passed.
 static TickType_t frame_ticks(uint32_t ms) {
-    return (ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS;
+    return (ms + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS + 1;
 }
 
 // True when at most `most` windows are in flight before the timeout, counted
@@ -213,7 +219,8 @@ static void frame_copy(const frame_t *frame, uint16_t *dst, const uint16_t *src,
 // The rectangle through the strips, as many rows at a time as a strip holds:
 // the copy of one strip overlaps the send of the other. Windows end in order,
 // so when at most one is in flight, the window that used this strip two
-// turns back has ended.
+// turns back has ended. esp_lcd itself also waits for the last window before
+// it starts the next, so this wait is the guard, not the pace.
 static void frame_send_strips(frame_send_t *send, frame_rect_t rect) {
     frame_t *frame = send->frame;
     uint16_t w = rect.x1 - rect.x0;
@@ -344,13 +351,16 @@ uint16_t frame_show(frame_t *frame, uint16_t width, uint16_t height) {
 }
 
 // At deinit() or at a soft reset, through the finalizer, so it never raises.
-// It waits for the last window first, because DMA can still read the memory.
-// If the bus is dead, that wait times out and the memory is freed anyway.
+// deinit() deletes the bus first, which waits for the windows on the wire.
+// The wait here guards any other caller; on a dead bus it times out and the
+// memory is freed anyway. The handle is cleared before the delete, because
+// the interrupt gives only to a handle that is not NULL.
 void frame_free(frame_t *frame) {
     if (frame->done != NULL) {
         frame_wait(frame, FRAME_ALL_SENT, xTaskGetTickCount());
-        vSemaphoreDelete(frame->done);
+        SemaphoreHandle_t done = frame->done;
         frame->done = NULL;
+        vSemaphoreDelete(done);
     }
     if (frame->pixels != NULL) {
         if (frame->memory == FRAME_IN_DMA) {
@@ -392,14 +402,14 @@ static void frame_check_keys(const mp_map_t *kw_args) {
     }
 }
 
-// An int in lo to hi, or a ValueError with the message that names the key.
-static mp_int_t frame_parse_int(mp_obj_t value, mp_int_t lo, mp_int_t hi, mp_rom_error_text_t message) {
-    if (!mp_obj_is_int(value) || mp_obj_is_bool(value)) {
-        mp_raise_ValueError(message);
+// An int in lo to hi, or a ValueError that names the key and the range.
+static mp_int_t frame_parse_int(mp_obj_t value, qstr key, mp_int_t lo, mp_int_t hi) {
+    mp_int_t n = lo - 1;
+    if (mp_obj_is_int(value) && !mp_obj_is_bool(value)) {
+        n = mp_obj_get_int(value);
     }
-    mp_int_t n = mp_obj_get_int(value);
     if (n < lo || n > hi) {
-        mp_raise_ValueError(message);
+        mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("%q must be %d to %d"), key, (int)lo, (int)hi);
     }
     return n;
 }
@@ -432,23 +442,22 @@ static frame_memory_t frame_parse_memory(const frame_t *frame, mp_obj_t value) {
 
 // 8, 16 or 32 px, kept as its shift, so a mark costs no division.
 static uint8_t frame_parse_tile(mp_obj_t value) {
-    mp_rom_error_text_t message = MP_ERROR_TEXT("tile must be 8, 16 or 32");
-    mp_int_t tile = frame_parse_int(value, 1 << FRAME_TILE_SHIFT_MIN, 1 << FRAME_TILE_SHIFT_MAX, message);
+    mp_int_t tile = mp_obj_is_int(value) && !mp_obj_is_bool(value) ? mp_obj_get_int(value) : 0;
     for (int shift = FRAME_TILE_SHIFT_MIN; shift <= FRAME_TILE_SHIFT_MAX; shift++) {
         if (tile == 1 << shift) {
             return shift;
         }
     }
-    mp_raise_ValueError(message);
+    mp_raise_msg_varg(&mp_type_ValueError, MP_ERROR_TEXT("tile must be %d, %d or %d"),
+        1 << FRAME_TILE_SHIFT_MIN, 1 << (FRAME_TILE_SHIFT_MIN + 1), 1 << FRAME_TILE_SHIFT_MAX);
 }
 
 // An internal framebuffer goes out with no copy, so nothing can swap it.
-static bool frame_parse_swap(const frame_t *frame, mp_obj_t value) {
-    bool swap = frame_parse_bool(value, MP_ERROR_TEXT("swap must be True or False"));
-    if (swap && frame->pixels != NULL && frame->memory == FRAME_IN_DMA) {
+// Checked on the result, so that defaults=True cannot bring a swap back.
+static void frame_check_swap(const frame_t *frame, const frame_config_t *next) {
+    if (next->swap && frame->pixels != NULL && frame->memory == FRAME_IN_DMA) {
         mp_raise_ValueError(MP_ERROR_TEXT("swap needs framebuffer=\"strips\"; set both before init()"));
     }
-    return swap;
 }
 
 // Each value given, checked; the rest as they are, or the defaults first.
@@ -458,8 +467,7 @@ static frame_config_t frame_parse(const frame_t *frame, const mp_arg_val_t *args
         && frame_parse_bool(args[ARG_defaults].u_obj, MP_ERROR_TEXT("defaults must be True or False"));
     frame_config_t next = restore ? frame->defaults : frame->config;
     if (args[ARG_timeout].u_obj != MP_OBJ_NULL) {
-        next.timeout_ms = frame_parse_int(args[ARG_timeout].u_obj, 1, FRAME_TIMEOUT_MAX_MS,
-            MP_ERROR_TEXT("timeout must be 1 to 60000 ms"));
+        next.timeout_ms = frame_parse_int(args[ARG_timeout].u_obj, MP_QSTR_timeout, 1, FRAME_TIMEOUT_MAX_MS);
     }
     if (args[ARG_framebuffer].u_obj != MP_OBJ_NULL) {
         next.memory = frame_parse_memory(frame, args[ARG_framebuffer].u_obj);
@@ -471,12 +479,12 @@ static frame_config_t frame_parse(const frame_t *frame, const mp_arg_val_t *args
         next.tile_shift = frame_parse_tile(args[ARG_tile].u_obj);
     }
     if (args[ARG_windows].u_obj != MP_OBJ_NULL) {
-        next.windows = frame_parse_int(args[ARG_windows].u_obj, 1, FRAME_WINDOWS_MAX,
-            MP_ERROR_TEXT("windows must be 1 to 64"));
+        next.windows = frame_parse_int(args[ARG_windows].u_obj, MP_QSTR_windows, 1, FRAME_WINDOWS_MAX);
     }
     if (args[ARG_swap].u_obj != MP_OBJ_NULL) {
-        next.swap = frame_parse_swap(frame, args[ARG_swap].u_obj);
+        next.swap = frame_parse_bool(args[ARG_swap].u_obj, MP_ERROR_TEXT("swap must be True or False"));
     }
+    frame_check_swap(frame, &next);
     return next;
 }
 

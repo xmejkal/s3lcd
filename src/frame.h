@@ -24,7 +24,7 @@ typedef enum {
 
 // The settings Python sets through config().
 typedef struct {
-    uint32_t timeout_ms;        // the longest time one show() may take; past it show() raises
+    uint32_t timeout_ms;        // show() raises when its windows have not ended by then (see config())
     frame_memory_t memory;      // asked for; read at init()
     bool partial;               // send only the tiles that changed, not the whole frame
     uint8_t tile_shift;         // a tile is 1 << tile_shift pixels square

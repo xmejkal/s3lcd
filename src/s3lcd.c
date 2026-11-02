@@ -2118,6 +2118,7 @@ void pngle_on_draw(pngle_t *pngle, uint32_t x, uint32_t y, uint32_t w, uint32_t 
 
 static mp_obj_t s3lcd_png(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // draws through _fill_rect, which marks nothing with tracking off
 
     mp_int_t x = mp_obj_get_int(args[2]);
     mp_int_t y = mp_obj_get_int(args[3]);
@@ -2206,7 +2207,6 @@ void pngClose(PNGFILE *pFile) {
 
 static mp_obj_t s3lcd_png_write(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
-    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     const char *filename = mp_obj_str_get_str(args[1]);
     int data_size = 0;
     int work_buffer_size = self->width * 3 * 2;
@@ -2626,13 +2626,10 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_show_obj, 1, 1, s3lcd_show);
 static mp_obj_t s3lcd_deinit(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
 
-    // First the frame: it waits until DMA stops reading its memory.
-    frame_free(&self->frame);
-    self->frame_buffer = NULL;
-    self->dma_buffer = NULL;
-    self->dma_buffer_size = 0;
-
-    // Also the finalizer, so a soft reset frees the bus and the next init() can claim it.
+    // The bus first: deleting the panel IO waits for the windows still on the
+    // wire, so no bus interrupt can give the frame's semaphore or DMA read its
+    // memory after frame_free. Also the finalizer, so a soft reset frees the
+    // bus and the next init() can claim it.
     if (self->io_handle != NULL) {
         esp_lcd_panel_del(self->panel_handle);
         self->panel_handle = NULL;
@@ -2647,6 +2644,10 @@ static mp_obj_t s3lcd_deinit(size_t n_args, const mp_obj_t *args) {
             self->bus_handle.spi = 0;  // IDF 5: the SPI bus handle is an int (the host id), not a pointer
         }
     }
+    frame_free(&self->frame);
+    self->frame_buffer = NULL;
+    self->dma_buffer = NULL;
+    self->dma_buffer_size = 0;
 
     m_free(self->work);
     self->work = NULL;
@@ -2659,10 +2660,13 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_deinit_obj, 1, 1, s3lcd_deinit)
 /// Set the settings given, all or none, and return every setting as a dict. config() only reads.
 /// An unknown key raises TypeError naming it. A bad value raises ValueError naming the key and what it allows,
 /// and a setting that needs init() again, given after init(), raises ValueError saying so.
-/// -- timeout: the longest time one show() may take, 1 to 60000 ms; past it show() raises OSError(ETIMEDOUT). Default 100.
+/// -- timeout: 1 to 60000 ms, default 100. show() raises OSError(ETIMEDOUT) when its windows have not all ended
+///    by then, checked at each wait, to within one 10 ms tick. esp_lcd's own waits inside a send have no limit,
+///    so a dead bus still hangs.
 /// -- framebuffer: "dma" keeps the frame in internal DMA RAM and sends it with no copy; "strips" keeps it
 ///    in PSRAM and copies it through two internal strips. Set it before init(). Default "dma"; when no
 ///    internal block is large enough, or the bus swaps bytes, init() prints a notice and uses "strips".
+///    After init(), the value in use and the value asked for are both accepted, so config(**config()) works.
 /// -- partial: show() sends only the tiles drawn in this frame or the one before. Default False.
 /// -- tile: the tile's side, 8, 16 or 32 px. Default 16.
 /// -- windows: past this many rectangles of changed tiles, show() sends the whole frame. 1 to 64, default 40.
@@ -2679,8 +2683,8 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(s3lcd_config_obj, 1, s3lcd_config);
 ///
 /// .track(on)
 /// With on False, draws mark no tiles, so a partial show() does not send them: for the still picture a game
-/// repaints the same way every frame. fill() then marks nothing too. text, bitmap, write, jpg, png, scroll and
-/// clear mark the whole frame even then. Default True.
+/// repaints the same way every frame. fill() then marks nothing too. text, bitmap, write, jpg, png, scroll,
+/// clear and a rotation mark the whole frame even then. Default True.
 ///
 
 static mp_obj_t s3lcd_track(mp_obj_t self_in, mp_obj_t on) {
