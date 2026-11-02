@@ -30,7 +30,7 @@ typedef struct {
     bool partial;               // send only the tiles that changed, not the whole frame
     uint8_t tile_shift;         // a tile is 1 << tile_shift pixels square
     uint8_t windows;            // past this many windows, show() sends the whole frame instead
-    bool swap;                  // swap the two bytes of each pixel on send; needs "strips"
+    bool swap;                  // swap the two bytes of each pixel on send; needs "strips" or "double"
 } frame_config_t;
 
 // The marks of one tile: drawn in this frame, drawn in the frame before.

@@ -138,7 +138,7 @@ void frame_alloc(frame_t *frame, uint16_t width, uint16_t height) {
 
 // The largest single send the bus must take: the whole frame from internal
 // RAM or from `outgoing`, or else one strip. The i80 bus reads it too, untested
-// with "double".
+// with "double" (P556 #760 tested SPI only).
 size_t frame_max_transfer(const frame_t *frame) {
     return frame->memory == FRAME_IN_STRIPS ? frame->strip_size : frame->size;
 }
@@ -215,7 +215,7 @@ typedef struct {
     uint16_t width;
     TickType_t start;
     unsigned turn;
-    size_t packed;
+    size_t packed_pixels;
 } frame_send_t;
 
 // Queue one window. The count goes up first, because the interrupt can end
@@ -240,9 +240,9 @@ static void frame_copy(const frame_t *frame, uint16_t *dst, const uint16_t *src,
     }
 }
 
-// The rectangle's rows, packed into dst, then queued from there. Whole rows
+// A copy of the rectangle's rows, packed into dst, queued from there. Whole rows
 // are one block in the frame, so they are one copy.
-static void frame_load(frame_send_t *send, frame_rect_t rect, uint16_t *dst) {
+static void frame_queue_copy(frame_send_t *send, frame_rect_t rect, uint16_t *dst) {
     frame_t *frame = send->frame;
     uint16_t w = rect.x1 - rect.x0;
     uint16_t rows = rect.y1 - rect.y0;
@@ -269,7 +269,7 @@ static void frame_send_strips(frame_send_t *send, frame_rect_t rect) {
         uint16_t rows = rect.y1 - y < step ? rect.y1 - y : step;
         uint16_t *strip = frame->strips[send->turn++ % FRAME_STRIP_COUNT];
         frame_wait_or_raise(frame, FRAME_OTHER_STRIP, send->start);
-        frame_load(send, (frame_rect_t){rect.x0, y, rect.x1, y + rows}, strip);
+        frame_queue_copy(send, (frame_rect_t){rect.x0, y, rect.x1, y + rows}, strip);
     }
 }
 
@@ -278,8 +278,8 @@ static void frame_send_strips(frame_send_t *send, frame_rect_t rect) {
 // sent. Windows never share a tile, so they fit in one frame's size. Nothing
 // waits here: the first wait of show() made sure the last frame was out.
 static void frame_send_packed(frame_send_t *send, frame_rect_t rect) {
-    frame_load(send, rect, send->frame->outgoing + send->packed);
-    send->packed += (size_t)(rect.x1 - rect.x0) * (rect.y1 - rect.y0);
+    frame_queue_copy(send, rect, send->frame->outgoing + send->packed_pixels);
+    send->packed_pixels += (size_t)(rect.x1 - rect.x0) * (rect.y1 - rect.y0);
 }
 
 // Whole rows of an internal framebuffer are one block of memory, so DMA reads
@@ -287,10 +287,9 @@ static void frame_send_packed(frame_send_t *send, frame_rect_t rect) {
 // through the strips.
 static void frame_send_rect(frame_send_t *send, frame_rect_t rect) {
     frame_t *frame = send->frame;
-    bool whole_rows = rect.x0 == 0 && rect.x1 == send->width;
     if (frame->memory == FRAME_DOUBLE) {
         frame_send_packed(send, rect);
-    } else if (frame->memory == FRAME_IN_DMA && whole_rows) {
+    } else if (frame->memory == FRAME_IN_DMA && rect.x0 == 0 && rect.x1 == send->width) {
         frame_queue(frame, rect, frame->pixels + (size_t)rect.y0 * send->width);
     } else {
         frame_send_strips(send, rect);
@@ -546,8 +545,12 @@ static frame_config_t frame_parse(const frame_t *frame, const mp_arg_val_t *args
     return next;
 }
 
-// The names of frame_memory_t, in its order.
-static const qstr frame_memory_names[] = {MP_QSTR_dma, MP_QSTR_strips, MP_QSTR_double};
+// The config() name of each frame_memory_t.
+static const qstr frame_memory_names[] = {
+    [FRAME_IN_DMA] = MP_QSTR_dma,
+    [FRAME_IN_STRIPS] = MP_QSTR_strips,
+    [FRAME_DOUBLE] = MP_QSTR_double,
+};
 
 // After init() it reports the memory in use, which differs after a fallback.
 static mp_obj_t frame_config_dict(const frame_t *frame) {

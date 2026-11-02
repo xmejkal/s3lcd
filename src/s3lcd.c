@@ -2642,6 +2642,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_fill_polygon_obj, 4, 9, s3lcd_f
 /// .show()
 /// Show the framebuffer: all of it, or with config(partial=True) the tiles that changed. Returns the count of
 /// windows sent, strip loads included; each costs bus setup. Raises OSError(ETIMEDOUT) when the send takes longer than config()'s timeout.
+/// With config(framebuffer="double") it returns once the windows are queued, and the next show() waits for them.
 ///
 
 static mp_obj_t s3lcd_show(size_t n_args, const mp_obj_t *args) {
