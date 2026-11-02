@@ -231,6 +231,7 @@ static void _setpixel(s3lcd_obj_t *self, uint16_t x, uint16_t y, uint16_t color,
             color = alpha_blend_565(color, *b, alpha);
         }
         *b = color;
+        frame_dirty(&self->frame, x, y, x + 1, y + 1);
     }
 }
 
@@ -238,7 +239,12 @@ static void _setpixel(s3lcd_obj_t *self, uint16_t x, uint16_t y, uint16_t color,
 //     return *(self->frame_buffer + x + y * self->width);
 // }
 
+// With tracking off, fill() repaints the background of a picture whose
+// changes the draws after it mark, so it marks nothing.
 static void _fill(s3lcd_obj_t *self, uint16_t color) {
+    if (self->frame.tracking) {
+        frame_dirty_all(&self->frame);
+    }
     uint16_t *b = self->frame_buffer;
     for (size_t i = 0; i < self->width * self->height; ++i) {
         *b++ = color;
@@ -258,6 +264,7 @@ static void _fill_rect(s3lcd_obj_t *self, uint16_t x, uint16_t y, uint16_t w, ui
         h = self->height - y;
     }
 
+    frame_dirty(&self->frame, x, y, x + w, y + h);
     uint16_t *b = self->frame_buffer + y * self->width + x;
     if (alpha == 255) {
         while (h--) {
@@ -422,6 +429,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_fill_rect_obj, 6, 7, s3lcd_fill
 
 static mp_obj_t s3lcd_clear(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     OPTIONAL_ARG(1, mp_int_t, mp_obj_get_int, color, BLACK)
     memset(self->frame_buffer, color & 0xff , self->frame_buffer_size);
     return mp_const_none;
@@ -583,6 +591,7 @@ static mp_obj_t s3lcd_blit_buffer(size_t n_args, const mp_obj_t *args) {
     mp_int_t h = mp_obj_get_int(args[5]);
     OPTIONAL_ARG(6, mp_int_t, mp_obj_get_int, alpha, 255)
 
+    frame_dirty(&self->frame, MAX(x, 0), MAX(y, 0), MIN(x + w, self->width), MIN(y + h, self->height));
     uint16_t *src = buf_info.buf;
     uint16_t stride = self->width - w;
     uint16_t *dst = (uint16_t *) self->frame_buffer + (y * self->width + x);
@@ -866,6 +875,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_write_len_obj, 3, 3, s3lcd_writ
 
 static mp_obj_t s3lcd_write(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     mp_obj_module_t *font = MP_OBJ_TO_PTR(args[1]);
 
     mp_int_t x = mp_obj_get_int(args[3]);
@@ -978,6 +988,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_write_obj, 5, 8, s3lcd_write);
 
 static mp_obj_t s3lcd_bitmap_from_tuple(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     mp_obj_t *bitmap_tuple = NULL;
     size_t bitmap_tuple_len = 0;
     mp_obj_tuple_get(args[1], &bitmap_tuple_len, &bitmap_tuple);
@@ -1021,6 +1032,7 @@ static mp_obj_t s3lcd_bitmap_from_tuple(size_t n_args, const mp_obj_t *args) {
 
 static mp_obj_t s3lcd_bitmap_from_module(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     mp_obj_module_t *bitmap = MP_OBJ_TO_PTR(args[1]);
     mp_int_t x = mp_obj_get_int(args[2]);
     mp_int_t y = mp_obj_get_int(args[3]);
@@ -1109,6 +1121,7 @@ static mp_obj_t s3lcd_text(size_t n_args, const mp_obj_t *args) {
 
     // extract arguments
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     mp_obj_module_t *font = MP_OBJ_TO_PTR(args[1]);
 
     if (mp_obj_is_int(args[2])) {
@@ -1201,6 +1214,7 @@ static void set_rotation(s3lcd_obj_t *self) {
 
     self->width = rotation->width;
     self->height = rotation->height;
+    frame_dirty_all(&self->frame);
 }
 
 ///
@@ -1293,6 +1307,7 @@ static MP_DEFINE_CONST_FUN_OBJ_2(s3lcd_vscsad_obj, s3lcd_vscsad);
 
 static mp_obj_t s3lcd_scroll(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     mp_int_t xstep = mp_obj_get_int(args[1]);
     mp_int_t ystep = mp_obj_get_int(args[2]);
     OPTIONAL_ARG(3, mp_int_t, mp_obj_get_int, fill, 0)
@@ -1869,6 +1884,7 @@ static int jpg_out(                                         // 1:Ok, 0:Aborted
 
 static mp_obj_t s3lcd_jpg(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     mp_int_t x = mp_obj_get_int(args[2]);
     mp_int_t y = mp_obj_get_int(args[3]);
 
@@ -2192,6 +2208,7 @@ void pngClose(PNGFILE *pFile) {
 
 static mp_obj_t s3lcd_png_write(size_t n_args, const mp_obj_t *args) {
     s3lcd_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    frame_dirty_all(&self->frame);    // writes the framebuffer directly
     const char *filename = mp_obj_str_get_str(args[1]);
     int data_size = 0;
     int work_buffer_size = self->width * 3 * 2;
@@ -2592,7 +2609,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_fill_polygon_obj, 4, 9, s3lcd_f
 
 ///
 /// .show()
-/// Show the framebuffer. Raises OSError(ETIMEDOUT) when the send takes longer than config()'s timeout.
+/// Show the framebuffer: all of it, or with config(partial=True) the tiles that changed. Raises OSError(ETIMEDOUT) when the send takes longer than config()'s timeout.
 ///
 
 static mp_obj_t s3lcd_show(size_t n_args, const mp_obj_t *args) {
@@ -2640,12 +2657,15 @@ static mp_obj_t s3lcd_deinit(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(s3lcd_deinit_obj, 1, 1, s3lcd_deinit);
 
 ///
-/// .config({timeout=ms, framebuffer="dma"|"strips"})
+/// .config({timeout=ms, framebuffer="dma"|"strips", partial=bool, tile=px, windows=n})
 /// Set the settings given, all or none, and return every setting as a dict.
 /// -- timeout: the longest time one show() may take, 1 to 60000 ms; past it show() raises OSError(ETIMEDOUT). Default 100.
 /// -- framebuffer: "dma" keeps the frame in internal DMA RAM and sends it with no copy; "strips" keeps it
 ///    in PSRAM and copies it through two internal strips. Set it before init(). Default "dma"; when no
 ///    internal block is large enough, or the bus swaps bytes, init() prints a notice and uses "strips".
+/// -- partial: show() sends only the tiles drawn in this frame or the one before. Default False.
+/// -- tile: the tile's side, 8, 16 or 32 px. Default 16.
+/// -- windows: past this many rectangles of changed tiles, show() sends the whole frame. 1 to 64, default 40.
 ///
 
 static mp_obj_t s3lcd_config(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
@@ -2653,6 +2673,20 @@ static mp_obj_t s3lcd_config(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
     return frame_config(&self->frame, n_args - 1, pos_args + 1, kw_args);
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(s3lcd_config_obj, 1, s3lcd_config);
+
+///
+/// .track(on)
+/// With on False, draws mark no tiles, so a partial show() does not send them: for the still picture a game
+/// repaints the same way every frame. fill() then marks nothing too. text, bitmap, write, jpg, png, scroll and
+/// clear mark the whole frame even then. Default True.
+///
+
+static mp_obj_t s3lcd_track(mp_obj_t self_in, mp_obj_t on) {
+    s3lcd_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    self->frame.tracking = mp_obj_is_true(on);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_2(s3lcd_track_obj, s3lcd_track);
 
 static const mp_rom_map_elem_t s3lcd_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_write), MP_ROM_PTR(&s3lcd_write_obj)},
@@ -2694,6 +2728,7 @@ static const mp_rom_map_elem_t s3lcd_locals_dict_table[] = {
     {MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&s3lcd_deinit_obj)},
     {MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&s3lcd_deinit_obj)},
     {MP_ROM_QSTR(MP_QSTR_config), MP_ROM_PTR(&s3lcd_config_obj)},
+    {MP_ROM_QSTR(MP_QSTR_track), MP_ROM_PTR(&s3lcd_track_obj)},
 };
 static MP_DEFINE_CONST_DICT(s3lcd_locals_dict, s3lcd_locals_dict_table);
 /* methods end */

@@ -5,6 +5,9 @@
 // frame_on_color_done once, after the last chunk. The task counts each window
 // up before it queues it, and the interrupt counts it down when it ends, so
 // the count says how many windows the panel has still to receive.
+//
+// With partial on, show() sends only the tiles drawn in this frame or the one
+// before, as rectangles. Draws mark their tiles through frame_dirty().
 
 #include <string.h>
 
@@ -20,6 +23,11 @@
 #define FRAME_STRIP_COUNT 2
 #define FRAME_ALL_SENT 0                // windows in flight when the panel has the whole frame
 #define FRAME_OTHER_STRIP 1             // windows in flight when a strip may be filled again
+#define FRAME_TILE_SHIFT 4              // default tile: 16 px, as in config(tile=16)
+#define FRAME_TILE_SHIFT_MIN 3          // tile=8, the smallest; the marks grid is sized for it
+#define FRAME_TILE_SHIFT_MAX 5          // tile=32
+#define FRAME_WINDOWS 40                // default: a window costs about 60-120 us of bus setup
+#define FRAME_WINDOWS_MAX 64            // the size of show()'s window list, on the stack
 
 // The callback runs inside the bus interrupt. If that interrupt lives in IRAM,
 // so must the callback, or a flash write that turns the cache off crashes it.
@@ -40,7 +48,10 @@ void frame_defaults(frame_t *frame, uint16_t strip_rows) {
     memset(frame, 0, sizeof(*frame));
     frame->config.timeout_ms = FRAME_TIMEOUT_MS;
     frame->config.memory = FRAME_IN_DMA;
+    frame->config.tile_shift = FRAME_TILE_SHIFT;
+    frame->config.windows = FRAME_WINDOWS;
     frame->strip_rows = strip_rows;
+    frame->tracking = true;
     portMUX_INITIALIZE(&frame->lock);
 }
 
@@ -52,6 +63,18 @@ static void frame_alloc_strips(frame_t *frame, uint16_t longest_axis) {
             mp_raise_OSError(MP_ENOMEM);
         }
     }
+}
+
+// Square, so that a rotation needs no new grid; internal RAM, because every
+// draw writes it.
+static void frame_alloc_marks(frame_t *frame, uint16_t longest_axis) {
+    int smallest = 1 << FRAME_TILE_SHIFT_MIN;
+    frame->grid = (longest_axis + smallest - 1) / smallest;
+    frame->marks = heap_caps_malloc((size_t)frame->grid * frame->grid, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (frame->marks == NULL) {
+        mp_raise_OSError(MP_ENOMEM);
+    }
+    frame_dirty_all(frame);
 }
 
 // At init(), before the bus: the framebuffer first, so that it gets the
@@ -77,7 +100,9 @@ void frame_alloc(frame_t *frame, uint16_t width, uint16_t height, bool swap) {
         frame->pixels = m_malloc(frame->size);      // MicroPython's heap: PSRAM on this board
     }
     memset(frame->pixels, 0, frame->size);
-    frame_alloc_strips(frame, width > height ? width : height);
+    uint16_t longest_axis = width > height ? width : height;
+    frame_alloc_strips(frame, longest_axis);
+    frame_alloc_marks(frame, longest_axis);
     frame->in_flight = 0;
     frame->done = xSemaphoreCreateBinary();
     if (frame->done == NULL) {
@@ -142,11 +167,30 @@ static void frame_wait_or_raise(frame_t *frame, int most, TickType_t start) {
     }
 }
 
-// Queue one window: rows y0 up to y1. The count goes up first, because the
-// interrupt can end the window before draw_bitmap returns.
-static void frame_send(frame_t *frame, uint16_t width, uint16_t y0, uint16_t y1, const uint16_t *src) {
+// Pixels x0 up to x1 and rows y0 up to y1 of the frame.
+typedef struct {
+    uint16_t x0, y0, x1, y1;
+} frame_rect_t;
+
+// Tile columns c0 up to c1 and tile rows r0 up to r1.
+typedef struct {
+    uint8_t c0, c1, r0, r1;
+} frame_window_t;
+
+// One show(): the frame's width in this rotation, the start of its one
+// deadline, and how many strips it filled so far, across windows.
+typedef struct {
+    frame_t *frame;
+    uint16_t width;
+    TickType_t start;
+    unsigned turn;
+} frame_send_t;
+
+// Queue one window. The count goes up first, because the interrupt can end
+// the window before draw_bitmap returns.
+static void frame_queue(frame_t *frame, frame_rect_t rect, const uint16_t *src) {
     frame_count(frame, +1);
-    esp_err_t err = esp_lcd_panel_draw_bitmap(frame->panel, 0, y0, width, y1, src);
+    esp_err_t err = esp_lcd_panel_draw_bitmap(frame->panel, rect.x0, rect.y0, rect.x1, rect.y1, src);
     if (err != ESP_OK) {
         frame_count(frame, -1);
         mp_raise_msg_varg(&mp_type_OSError, MP_ERROR_TEXT("frame: draw_bitmap failed: %s"), esp_err_to_name(err));
@@ -163,34 +207,134 @@ static void frame_copy(const frame_t *frame, uint16_t *dst, const uint16_t *src,
     }
 }
 
-// The PSRAM frame, strip by strip: the copy of one strip overlaps the send of
-// the other. Windows end in order, so when at most one is in flight, the
-// window that used this strip two steps back has ended.
-static void frame_send_strips(frame_t *frame, uint16_t width, uint16_t height, TickType_t start) {
-    const uint16_t *src = frame->pixels;
-    for (uint16_t y = 0, k = 0; y < height; y += frame->strip_rows, k++) {
-        uint16_t rows = height - y < frame->strip_rows ? height - y : frame->strip_rows;
-        size_t count = (size_t)rows * width;
-        uint16_t *strip = frame->strips[k % FRAME_STRIP_COUNT];
-        frame_wait_or_raise(frame, FRAME_OTHER_STRIP, start);
-        frame_copy(frame, strip, src, count);
-        frame_send(frame, width, y, y + rows, strip);
-        src += count;
+// The rectangle through the strips, as many rows at a time as a strip holds:
+// the copy of one strip overlaps the send of the other. Windows end in order,
+// so when at most one is in flight, the window that used this strip two
+// turns back has ended.
+static void frame_send_strips(frame_send_t *send, frame_rect_t rect) {
+    frame_t *frame = send->frame;
+    uint16_t w = rect.x1 - rect.x0;
+    uint16_t step = frame->strip_size / sizeof(uint16_t) / w;     // rows per strip
+    for (uint16_t y = rect.y0; y < rect.y1; y += step) {
+        uint16_t rows = rect.y1 - y < step ? rect.y1 - y : step;
+        uint16_t *strip = frame->strips[send->turn++ % FRAME_STRIP_COUNT];
+        frame_wait_or_raise(frame, FRAME_OTHER_STRIP, send->start);
+        const uint16_t *src = frame->pixels + (size_t)y * send->width + rect.x0;
+        for (uint16_t r = 0; r < rows; r++) {
+            frame_copy(frame, strip + (size_t)r * w, src + (size_t)r * send->width, w);
+        }
+        frame_queue(frame, (frame_rect_t){rect.x0, y, rect.x1, y + rows}, strip);
     }
 }
 
-// Send the whole framebuffer, and return when the panel has all of it.
+// Whole rows of an internal framebuffer are one block of memory, so DMA reads
+// them where they are. Anything else goes through the strips.
+static void frame_send_rect(frame_send_t *send, frame_rect_t rect) {
+    frame_t *frame = send->frame;
+    bool whole_rows = rect.x0 == 0 && rect.x1 == send->width;
+    if (frame->memory == FRAME_IN_DMA && whole_rows) {
+        frame_queue(frame, rect, frame->pixels + (size_t)rect.y0 * send->width);
+    } else {
+        frame_send_strips(send, rect);
+    }
+}
+
+// A tile goes out when it was drawn in this frame or in the one before: a
+// tile that held a moving object last frame holds only the still picture now,
+// and the panel still shows the object.
+static bool frame_tile_changed(const frame_t *frame, int tx, int ty) {
+    return frame->marks[ty * frame->grid + tx] != 0;
+}
+
+// Grow the window that ends just above this run and has the same columns, or
+// add a new one. Returns the new count, or -1 past the windows setting.
+static int frame_add_run(const frame_t *frame, frame_window_t *windows, int count, int c0, int c1, int r) {
+    for (int i = 0; i < count; i++) {
+        if (windows[i].r1 == r && windows[i].c0 == c0 && windows[i].c1 == c1) {
+            windows[i].r1 = r + 1;
+            return count;
+        }
+    }
+    if (count == frame->config.windows) {
+        return -1;
+    }
+    windows[count] = (frame_window_t){c0, c1, r, r + 1};
+    return count + 1;
+}
+
+// The changed tiles as windows, top to bottom: each run of changed tiles along
+// a tile row, joined to the window above when the columns match. Returns the
+// count, or -1 when the whole frame is the cheaper send.
+static int frame_find_windows(const frame_t *frame, frame_window_t *windows, int cols, int rows) {
+    int count = 0;
+    for (int r = 0; r < rows && count >= 0; r++) {
+        int c = 0;
+        while (c < cols && count >= 0) {
+            if (!frame_tile_changed(frame, c, r)) {
+                c++;
+                continue;
+            }
+            int c0 = c;
+            while (c < cols && frame_tile_changed(frame, c, r)) {
+                c++;
+            }
+            count = frame_add_run(frame, windows, count, c0, c, r);
+        }
+    }
+    return count;
+}
+
+static uint16_t frame_min(uint16_t a, uint16_t b) {
+    return a < b ? a : b;
+}
+
+// A window in pixels; the last tile of a row or column can stick out of the frame.
+static frame_rect_t frame_window_rect(const frame_t *frame, frame_window_t win, uint16_t width, uint16_t height) {
+    int shift = frame->config.tile_shift;
+    return (frame_rect_t){
+        win.c0 << shift, win.r0 << shift,
+        frame_min(win.c1 << shift, width), frame_min(win.r1 << shift, height),
+    };
+}
+
+// After a show(): this frame's marks become the frame before's, and the next
+// frame starts unmarked.
+static void frame_age_marks(frame_t *frame) {
+    size_t count = (size_t)frame->grid * frame->grid;
+    for (size_t i = 0; i < count; i++) {
+        frame->marks[i] = (frame->marks[i] & FRAME_MARK_NOW) ? FRAME_MARK_BEFORE : 0;
+    }
+}
+
+// Every tile changed: at init(), a rotation, a fill(), a clear(), and any draw
+// that writes the framebuffer outside _setpixel, _fill_rect and blit_buffer.
+// It marks even with tracking off, so such a draw is never left unsent.
+void frame_dirty_all(frame_t *frame) {
+    if (frame->marks == NULL) {     // before init(): nothing to mark yet
+        return;
+    }
+    memset(frame->marks, FRAME_MARK_NOW, (size_t)frame->grid * frame->grid);
+}
+
+// Send what changed, or the whole frame, and return when the panel has all of it.
 void frame_show(frame_t *frame, uint16_t width, uint16_t height) {
-    TickType_t start = xTaskGetTickCount();
+    frame_send_t send = {frame, width, xTaskGetTickCount(), 0};
     // A window of a frame that timed out can still end now. Wait for it first,
     // so that it cannot count as a window of this frame.
-    frame_wait_or_raise(frame, FRAME_ALL_SENT, start);
-    if (frame->memory == FRAME_IN_DMA) {
-        frame_send(frame, width, 0, height, frame->pixels);
-    } else {
-        frame_send_strips(frame, width, height, start);
+    frame_wait_or_raise(frame, FRAME_ALL_SENT, send.start);
+    int shift = frame->config.tile_shift;
+    int cols = (width + (1 << shift) - 1) >> shift;
+    int rows = (height + (1 << shift) - 1) >> shift;
+    frame_window_t windows[FRAME_WINDOWS_MAX];
+    int count = frame->config.partial ? frame_find_windows(frame, windows, cols, rows) : -1;
+    if (count < 0) {
+        frame_send_rect(&send, (frame_rect_t){0, 0, width, height});
     }
-    frame_wait_or_raise(frame, FRAME_ALL_SENT, start);
+    for (int i = 0; i < count; i++) {
+        frame_send_rect(&send, frame_window_rect(frame, windows[i], width, height));
+    }
+    frame_wait_or_raise(frame, FRAME_ALL_SENT, send.start);
+    frame_age_marks(frame);
 }
 
 // At deinit() or at a soft reset, through the finalizer, so it never raises.
@@ -214,6 +358,8 @@ void frame_free(frame_t *frame) {
         heap_caps_free(frame->strips[i]);
         frame->strips[i] = NULL;
     }
+    heap_caps_free(frame->marks);
+    frame->marks = NULL;
 }
 
 static uint32_t frame_parse_timeout(mp_obj_t value) {
@@ -243,6 +389,25 @@ static frame_memory_t frame_parse_memory(const frame_t *frame, mp_obj_t value) {
     return memory;
 }
 
+// 8, 16 or 32 px, kept as its shift, so a mark costs no division.
+static uint8_t frame_parse_tile(mp_obj_t value) {
+    mp_int_t tile = mp_obj_get_int(value);
+    for (int shift = FRAME_TILE_SHIFT_MIN; shift <= FRAME_TILE_SHIFT_MAX; shift++) {
+        if (tile == 1 << shift) {
+            return shift;
+        }
+    }
+    mp_raise_ValueError(MP_ERROR_TEXT("tile must be 8, 16 or 32"));
+}
+
+static uint8_t frame_parse_windows(mp_obj_t value) {
+    mp_int_t windows = mp_obj_get_int(value);
+    if (windows < 1 || windows > FRAME_WINDOWS_MAX) {
+        mp_raise_ValueError(MP_ERROR_TEXT("windows must be 1 to 64"));
+    }
+    return (uint8_t)windows;
+}
+
 // After init() it reports the memory in use, which differs after a fallback.
 static mp_obj_t frame_config_dict(const frame_t *frame) {
     frame_memory_t memory = frame->pixels != NULL ? frame->memory : frame->config.memory;
@@ -250,16 +415,22 @@ static mp_obj_t frame_config_dict(const frame_t *frame) {
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_timeout), mp_obj_new_int(frame->config.timeout_ms));
     mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_framebuffer),
         MP_OBJ_NEW_QSTR(memory == FRAME_IN_DMA ? MP_QSTR_dma : MP_QSTR_strips));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_partial), mp_obj_new_bool(frame->config.partial));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_tile), mp_obj_new_int(1 << frame->config.tile_shift));
+    mp_obj_dict_store(dict, MP_OBJ_NEW_QSTR(MP_QSTR_windows), mp_obj_new_int(frame->config.windows));
     return dict;
 }
 
 // config(**settings): check every value given, then apply them all, so that a
 // bad one changes nothing. Returns every setting as a dict.
 mp_obj_t frame_config(frame_t *frame, size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
-    enum { ARG_timeout, ARG_framebuffer };
+    enum { ARG_timeout, ARG_framebuffer, ARG_partial, ARG_tile, ARG_windows };
     static const mp_arg_t allowed_args[] = {
         {MP_QSTR_timeout, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
         {MP_QSTR_framebuffer, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
+        {MP_QSTR_partial, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
+        {MP_QSTR_tile, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
+        {MP_QSTR_windows, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
@@ -271,6 +442,20 @@ mp_obj_t frame_config(frame_t *frame, size_t n_args, const mp_obj_t *pos_args, m
     if (args[ARG_framebuffer].u_obj != MP_OBJ_NULL) {
         next.memory = frame_parse_memory(frame, args[ARG_framebuffer].u_obj);
     }
+    if (args[ARG_partial].u_obj != MP_OBJ_NULL) {
+        next.partial = mp_obj_is_true(args[ARG_partial].u_obj);
+    }
+    if (args[ARG_tile].u_obj != MP_OBJ_NULL) {
+        next.tile_shift = frame_parse_tile(args[ARG_tile].u_obj);
+    }
+    if (args[ARG_windows].u_obj != MP_OBJ_NULL) {
+        next.windows = frame_parse_windows(args[ARG_windows].u_obj);
+    }
+    // Marks made at the old tile size point at the wrong tiles.
+    bool retiled = next.tile_shift != frame->config.tile_shift;
     frame->config = next;
+    if (retiled) {
+        frame_dirty_all(frame);
+    }
     return frame_config_dict(frame);
 }
