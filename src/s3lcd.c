@@ -71,7 +71,6 @@
 
 #define TAG "S3LCD"
 
-#define _swap_bytes(val) (((val >> 8) | (val << 8)) & 0xFFFF)
 #define _swap_int16_t(a, b) \
     {                       \
         int16_t t = a;      \
@@ -183,20 +182,7 @@ static uint16_t color565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t) ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b & 0xF8) >> 3);
 }
 
-static uint16_t alpha_blend_565(uint16_t fg, uint16_t bg, uint8_t alpha) {
-    if (alpha == 0) {
-        return bg;
-    }
-
-    if (alpha == 255) {
-        return fg;
-    }
-
-    uint8_t r = ((fg >> 11) * alpha + (bg >> 11) * (255 - alpha)) >> 8;
-    uint8_t g = (((fg >> 5) & 0x3f) * alpha + ((bg >> 5) & 0x3f) * (255 - alpha)) >> 8;
-    uint8_t b = ((fg & 0x1f) * alpha + (bg & 0x1f) * (255 - alpha)) >> 8;
-    return (r << 11) | (g << 5) | b;
-}
+#include "blend565.h"  // alpha_blend_565 and _swap_bytes (P603: panel byte order)
 
 #define OPTIONAL_ARG(arg_num, arg_type, arg_obj_get, arg_name, arg_default) \
     arg_type arg_name = arg_default;                                        \
@@ -1108,6 +1094,8 @@ static mp_obj_t s3lcd_bitmap_from_module(size_t n_args, const mp_obj_t *args) {
         for (int xx = 0; xx < width; xx++) {
             int color_idx = get_color(bpp);
             uint16_t color = mp_obj_get_int(palette[color_idx]);
+            // Later, not MVP (P603): the palette holds normal order and the frame panel order, so a blend here
+            // mixes the two orders. No game calls bitmap().
             if (alpha != 255) {
                 color = alpha_blend_565(color, *b, alpha);
             }
