@@ -1,6 +1,6 @@
 /*
  * The blend of two RGB565 colours, moved out of s3lcd.c (MIT, Copyright (c) 2020-2023 Russ Hughes) so a Mac test
- * builds the same code (tests/test_blend.py).
+ * builds the same code (pixel-games tests/test_blend.py).
  *
  * P603: this fork's frame buffer holds colours in the panel's byte order. The games run the driver with
  * swap_color_bytes=False and swap each colour once when they make it (games/gfx.py c565, games/lcd.py). So the blend
